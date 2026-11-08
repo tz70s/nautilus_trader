@@ -38,7 +38,9 @@ use nautilus_live::{
 use nautilus_model::identifiers::InstrumentId;
 
 use super::sync::BookSyncTracker;
-use crate::websocket::{client::HyperliquidWebSocketClient, error::HyperliquidWsError};
+use crate::websocket::{
+    book::BookStreamOptions, client::HyperliquidWebSocketClient, error::HyperliquidWsError,
+};
 
 pub(crate) type BookRecovery = Recovery<HyperliquidWsError>;
 
@@ -52,8 +54,7 @@ pub(crate) type BookRecovery = Recovery<HyperliquidWsError>;
 )]
 pub(crate) fn spawn_subscription_task(
     instrument_id: InstrumentId,
-    n_sig_figs: Option<u32>,
-    mantissa: Option<u32>,
+    options: BookStreamOptions,
     book_sync: BookSyncTracker,
     ws_client: HyperliquidWebSocketClient,
     snapshot_timeout: Duration,
@@ -69,7 +70,7 @@ pub(crate) fn spawn_subscription_task(
     if let Err(e) = tasks.spawn(async move {
         let _guard = guard;
         let result = ws_client
-            .subscribe_book_gated(instrument_id, n_sig_figs, mantissa, cancel.clone(), gate)
+            .subscribe_book_gated(instrument_id, options, cancel.clone(), gate)
             .await;
 
         if cancel.is_cancelled() {
@@ -289,8 +290,7 @@ mod tests {
 
         spawn_subscription_task(
             instrument_id,
-            None,
-            None,
+            BookStreamOptions::default(),
             book_sync.clone(),
             ws_client,
             Duration::from_secs(10),

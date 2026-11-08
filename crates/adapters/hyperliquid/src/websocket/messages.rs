@@ -106,6 +106,9 @@ pub enum SubscriptionRequest {
         n_sig_figs: Option<u32>,
         #[serde(skip_serializing_if = "Option::is_none")]
         mantissa: Option<u32>,
+        /// Top 5 levels about every 0.5 s instead of 20 levels about every 5 s.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        fast: Option<bool>,
     },
     /// Trade updates.
     Trades { coin: Ustr },
@@ -1282,11 +1285,27 @@ mod tests {
             coin: Ustr::from("BTC"),
             n_sig_figs: Some(5),
             mantissa: None,
+            fast: None,
         };
 
         let json = serde_json::to_string(&sub).unwrap();
         assert!(json.contains(r#""type":"l2Book""#));
         assert!(json.contains(r#""coin":"BTC""#));
+    }
+
+    #[rstest]
+    fn test_subscription_request_serialization_fast() {
+        let sub = |fast| SubscriptionRequest::L2Book {
+            coin: Ustr::from("BTC"),
+            n_sig_figs: None,
+            mantissa: None,
+            fast,
+        };
+
+        let json = serde_json::to_string(&sub(Some(true))).unwrap();
+        assert!(json.contains(r#""fast":true"#));
+        let json = serde_json::to_string(&sub(None)).unwrap();
+        assert!(!json.contains("fast"));
     }
 
     #[rstest]

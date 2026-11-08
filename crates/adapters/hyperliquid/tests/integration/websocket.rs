@@ -1739,6 +1739,7 @@ async fn test_book_precision_options_survive_reconnection() {
             InstrumentId::from("BTC-USD-PERP.HYPERLIQUID"),
             Some(5),
             Some(2),
+            None,
         )
         .await
         .expect("subscribe failed");
@@ -1798,7 +1799,7 @@ async fn test_book_resubscribe_after_reconnect_cycle_reaches_venue() {
 
     let instrument_id = InstrumentId::from("BTC-USD-PERP.HYPERLIQUID");
     client
-        .subscribe_book_with_options(instrument_id, Some(5), None)
+        .subscribe_book_with_options(instrument_id, Some(5), None, None)
         .await
         .expect("subscribe failed");
 
@@ -1825,7 +1826,7 @@ async fn test_book_resubscribe_after_reconnect_cycle_reaches_venue() {
         .expect("client inactive after reconnect");
 
     client
-        .subscribe_book_with_options(instrument_id, Some(5), None)
+        .subscribe_book_with_options(instrument_id, Some(5), None, None)
         .await
         .expect("resubscribe failed");
 
@@ -1868,7 +1869,7 @@ async fn test_book_subscribe_recovers_after_venue_reject() {
 
     let instrument_id = InstrumentId::from("BTC-USD-PERP.HYPERLIQUID");
     client
-        .subscribe_book_with_options(instrument_id, Some(5), None)
+        .subscribe_book_with_options(instrument_id, Some(5), None, None)
         .await
         .expect("subscribe failed");
 
@@ -1892,7 +1893,7 @@ async fn test_book_subscribe_recovers_after_venue_reject() {
         .await
         .expect("unsubscribe failed");
     client
-        .subscribe_book_with_options(instrument_id, Some(5), None)
+        .subscribe_book_with_options(instrument_id, Some(5), None, None)
         .await
         .expect("resubscribe failed");
 
@@ -2018,7 +2019,7 @@ async fn test_depth_only_unsubscribe_tears_down_stream_with_original_options() {
 
     let instrument_id = InstrumentId::from("BTC-USD-PERP.HYPERLIQUID");
     client
-        .subscribe_book_depth_with_options(instrument_id, Some(4), None)
+        .subscribe_book_depth_with_options(instrument_id, Some(4), None, None)
         .await
         .expect("subscribe depth failed");
 
@@ -2087,7 +2088,7 @@ async fn test_resubscribe_book_echoes_original_options() {
 
     let instrument_id = InstrumentId::from("BTC-USD-PERP.HYPERLIQUID");
     client
-        .subscribe_book_with_options(instrument_id, Some(5), Some(2))
+        .subscribe_book_with_options(instrument_id, Some(5), Some(2), None)
         .await
         .expect("subscribe failed");
 

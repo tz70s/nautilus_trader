@@ -445,11 +445,13 @@ impl HyperliquidWebSocketClient {
                                 coin,
                                 n_sig_figs,
                                 mantissa,
+                                fast,
                             } = &mut subscription
                                 && let Some(options) = book_streams.options(coin)
                             {
                                 *n_sig_figs = options.n_sig_figs;
                                 *mantissa = options.mantissa;
+                                *fast = options.fast;
                             }
 
                             if let Err(e) = cmd_tx_for_reconnect.send(HandlerCommand::Subscribe {
@@ -1428,7 +1430,7 @@ impl HyperliquidWebSocketClient {
 
     /// Subscribe to L2 order book for an instrument.
     pub async fn subscribe_book(&self, instrument_id: InstrumentId) -> anyhow::Result<()> {
-        self.subscribe_book_with_options(instrument_id, None, None)
+        self.subscribe_book_with_options(instrument_id, None, None, None)
             .await
     }
 
@@ -1443,6 +1445,7 @@ impl HyperliquidWebSocketClient {
         instrument_id: InstrumentId,
         n_sig_figs: Option<u32>,
         mantissa: Option<u32>,
+        fast: Option<bool>,
     ) -> anyhow::Result<()> {
         let instrument = self
             .get_instrument(&instrument_id)
@@ -1456,7 +1459,12 @@ impl HyperliquidWebSocketClient {
             .send(HandlerCommand::UpdateInstrument(instrument.clone()))
             .map_err(|e| anyhow::anyhow!("Failed to send UpdateInstrument command: {e}"))?;
 
-        self.send_book_stream_subscribe(&cmd_tx, coin, BookStreamUse::Deltas, n_sig_figs, mantissa)
+        let options = BookStreamOptions {
+            n_sig_figs,
+            mantissa,
+            fast,
+        };
+        self.send_book_stream_subscribe(&cmd_tx, coin, BookStreamUse::Deltas, options)
     }
 
     /// Subscribes the coin's `l2Book` stream for order book deltas, opening `gate` once the
@@ -1468,8 +1476,7 @@ impl HyperliquidWebSocketClient {
     pub(crate) async fn subscribe_book_gated(
         &self,
         instrument_id: InstrumentId,
-        n_sig_figs: Option<u32>,
-        mantissa: Option<u32>,
+        options: BookStreamOptions,
         cancel: CancellationToken,
         gate: SnapshotGate,
     ) -> Result<(), HyperliquidWsError> {
@@ -1490,13 +1497,13 @@ impl HyperliquidWebSocketClient {
             .send(HandlerCommand::UpdateInstrument(instrument))
             .map_err(|e| HyperliquidWsError::ChannelSend(e.to_string()))?;
 
-        let registration =
-            self.register_book_stream(coin, BookStreamUse::Deltas, n_sig_figs, mantissa);
+        let registration = self.register_book_stream(coin, BookStreamUse::Deltas, options);
 
         let subscription = SubscriptionRequest::L2Book {
             coin,
             mantissa: registration.options.mantissa,
             n_sig_figs: registration.options.n_sig_figs,
+            fast: registration.options.fast,
         };
 
         let replace = !registration.subscribe;
@@ -1541,7 +1548,7 @@ impl HyperliquidWebSocketClient {
     /// [`Self::subscribe_book`] and flags the handler to additionally emit
     /// `NautilusWsMessage::Depth` for this coin.
     pub async fn subscribe_book_depth(&self, instrument_id: InstrumentId) -> anyhow::Result<()> {
-        self.subscribe_book_depth_with_options(instrument_id, None, None)
+        self.subscribe_book_depth_with_options(instrument_id, None, None, None)
             .await
     }
 
@@ -1556,6 +1563,7 @@ impl HyperliquidWebSocketClient {
         instrument_id: InstrumentId,
         n_sig_figs: Option<u32>,
         mantissa: Option<u32>,
+        fast: Option<bool>,
     ) -> anyhow::Result<()> {
         let instrument = self
             .get_instrument(&instrument_id)
@@ -1575,7 +1583,12 @@ impl HyperliquidWebSocketClient {
             })
             .map_err(|e| anyhow::anyhow!("Failed to send SetDepthSub command: {e}"))?;
 
-        self.send_book_stream_subscribe(&cmd_tx, coin, BookStreamUse::Depth, n_sig_figs, mantissa)
+        let options = BookStreamOptions {
+            n_sig_figs,
+            mantissa,
+            fast,
+        };
+        self.send_book_stream_subscribe(&cmd_tx, coin, BookStreamUse::Depth, options)
     }
 
     /// Unsubscribe from order book depth-10 snapshots.
@@ -1914,6 +1927,7 @@ impl HyperliquidWebSocketClient {
             coin,
             mantissa: options.mantissa,
             n_sig_figs: options.n_sig_figs,
+            fast: options.fast,
         };
 
         self.send_stream_resubscribe(&cmd_tx, subscription)
@@ -1957,6 +1971,7 @@ impl HyperliquidWebSocketClient {
             coin,
             mantissa: options.mantissa,
             n_sig_figs: options.n_sig_figs,
+            fast: options.fast,
         };
 
         cmd_tx
@@ -1981,16 +1996,16 @@ impl HyperliquidWebSocketClient {
         cmd_tx: &tokio::sync::mpsc::UnboundedSender<HandlerCommand>,
         coin: Ustr,
         stream_use: BookStreamUse,
-        n_sig_figs: Option<u32>,
-        mantissa: Option<u32>,
+        options: BookStreamOptions,
     ) -> anyhow::Result<()> {
-        let registration = self.register_book_stream(coin, stream_use, n_sig_figs, mantissa);
+        let registration = self.register_book_stream(coin, stream_use, options);
 
         if registration.subscribe {
             let subscription = SubscriptionRequest::L2Book {
                 coin,
                 mantissa: registration.options.mantissa,
                 n_sig_figs: registration.options.n_sig_figs,
+                fast: registration.options.fast,
             };
 
             if let Err(e) = self.send_subscription(cmd_tx, subscription) {
@@ -2006,22 +2021,14 @@ impl HyperliquidWebSocketClient {
         &self,
         coin: Ustr,
         stream_use: BookStreamUse,
-        n_sig_figs: Option<u32>,
-        mantissa: Option<u32>,
+        options: BookStreamOptions,
     ) -> BookStreamRegistration {
-        let registration = self.book_streams.register(
-            coin,
-            stream_use,
-            BookStreamOptions {
-                n_sig_figs,
-                mantissa,
-            },
-        );
+        let registration = self.book_streams.register(coin, stream_use, options);
 
         if registration.options_mismatch {
             log::warn!(
-                "Requested l2Book options for {coin} (n_sig_figs={n_sig_figs:?}, mantissa={mantissa:?}) \
-                differ from the active stream ({:?}), keeping active options",
+                "Requested l2Book options for {coin} ({options:?}) differ from the active stream \
+                ({:?}), keeping active options",
                 registration.options,
             );
         }
@@ -2041,6 +2048,7 @@ impl HyperliquidWebSocketClient {
                     coin,
                     mantissa: options.mantissa,
                     n_sig_figs: options.n_sig_figs,
+                    fast: options.fast,
                 };
 
                 self.send_unsubscription(cmd_tx, subscription)?;
@@ -2632,6 +2640,7 @@ fn subscription_from_topic(topic: &str) -> anyhow::Result<SubscriptionRequest> {
             coin: Ustr::from(rest.context("Missing coin")?),
             mantissa: None,
             n_sig_figs: None,
+            fast: None,
         }),
         HyperliquidWsChannel::Trades => Ok(SubscriptionRequest::Trades {
             coin: Ustr::from(rest.context("Missing coin")?),
@@ -2827,7 +2836,7 @@ mod tests {
     #[case(SubscriptionRequest::Candle { coin: "SOL".into(), interval: HyperliquidBarInterval::OneHour })]
     #[case(SubscriptionRequest::OrderUpdates { user: "0x123".to_string() })]
     #[case(SubscriptionRequest::Trades { coin: "vntls:vCURSOR".into() })]
-    #[case(SubscriptionRequest::L2Book { coin: "vntls:vCURSOR".into(), mantissa: None, n_sig_figs: None })]
+    #[case(SubscriptionRequest::L2Book { coin: "vntls:vCURSOR".into(), mantissa: None, n_sig_figs: None, fast: None })]
     #[case(SubscriptionRequest::Candle { coin: "vntls:vCURSOR".into(), interval: HyperliquidBarInterval::OneHour })]
     fn test_subscription_reconstruction(#[case] subscription: SubscriptionRequest) {
         let topic = subscription_topic(&subscription);
@@ -3222,8 +3231,7 @@ mod tests {
         let result = client
             .subscribe_book_gated(
                 instrument.id(),
-                None,
-                None,
+                BookStreamOptions::default(),
                 CancellationToken::new(),
                 SnapshotGate::default(),
             )

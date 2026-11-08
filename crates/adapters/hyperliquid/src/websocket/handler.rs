@@ -2045,6 +2045,7 @@ mod tests {
             coin: Ustr::from("BTC"),
             n_sig_figs: None,
             mantissa: None,
+            fast: None,
         };
 
         let failed_gate = SnapshotGate::default();

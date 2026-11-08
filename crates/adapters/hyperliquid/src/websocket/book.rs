@@ -41,6 +41,7 @@ pub(crate) enum BookStreamUse {
 pub(crate) struct BookStreamOptions {
     pub n_sig_figs: Option<u32>,
     pub mantissa: Option<u32>,
+    pub fast: Option<bool>,
 }
 
 /// Outcome of registering a logical use: whether a venue subscribe should be
@@ -161,6 +162,7 @@ mod tests {
         BookStreamOptions {
             n_sig_figs,
             mantissa,
+            fast: None,
         }
     }
 
