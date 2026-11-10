@@ -21,6 +21,7 @@ pub mod inflight;
 
 mod settlement;
 
+use ahash::AHashMap;
 use std::{
     cell::RefCell,
     cmp::min,
@@ -143,6 +144,8 @@ pub struct OrderMatchingEngine {
     queue_snapshot_in_progress: bool,
     queue_ids_by_price: IndexMap<PriceRaw, IndexSet<ClientOrderId>>,
     queue_excess: IndexMap<ClientOrderId, QuantityRaw>,
+    /// When each order of an L3 book arrived, for `queue_priority_ms`.
+    book_order_ts: AHashMap<OrderId, UnixNanos>,
     queue_id_scratch: Vec<ClientOrderId>,
     queue_pending_scratch: Vec<(ClientOrderId, PriceRaw)>,
     queue_stale_scratch: Vec<ClientOrderId>,
@@ -243,6 +246,7 @@ impl OrderMatchingEngine {
             queue_snapshot_in_progress: false,
             queue_ids_by_price: IndexMap::new(),
             queue_excess: IndexMap::new(),
+            book_order_ts: AHashMap::new(),
             queue_id_scratch: Vec::new(),
             queue_pending_scratch: Vec::new(),
             queue_stale_scratch: Vec::new(),
@@ -315,6 +319,7 @@ impl OrderMatchingEngine {
         self.ask_consumption.clear();
         self.queue_pending.clear();
         self.queue_ahead_orders.clear();
+        self.book_order_ts.clear();
         self.queue_ahead_total.clear();
         self.queue_snapshot_in_progress = false;
         self.queue_ids_by_price.clear();
@@ -579,25 +584,61 @@ impl OrderMatchingEngine {
         })
     }
 
+    /// Keeps when each order of an L3 book arrived, for `queue_priority_ms`.
+    fn note_book_order(&mut self, delta: &OrderBookDelta) {
+        if self.book_type != BookType::L3_MBO || self.config.queue_priority_ms.is_none() {
+            return;
+        }
+        match delta.action {
+            BookAction::Add => {
+                self.book_order_ts
+                    .insert(delta.order.order_id, delta.ts_event);
+            }
+            BookAction::Delete => {
+                self.book_order_ts.remove(&delta.order.order_id);
+            }
+            BookAction::Clear => self.book_order_ts.clear(),
+            BookAction::Update => {}
+        }
+    }
+
     /// Records the queue ahead of `order` at `price`: the level's resting
-    /// size, or none when it joins the `front`.
-    fn snapshot_queue_position(&mut self, order: &OrderAny, price: Price, front: bool) {
+    /// orders, or with `priority_ms` only those that arrived more than that
+    /// long before now (none off an L3 book).
+    fn snapshot_queue_position(
+        &mut self,
+        order: &OrderAny,
+        price: Price,
+        priority_ms: Option<u64>,
+    ) {
         if !self.config.queue_position {
             return;
         }
         let size_prec = self.instrument.size_precision();
+        let side = OrderCore::opposite_side(order.order_side());
+        let now = self.clock.borrow().timestamp_ns().as_u64();
+        let older = |id: &OrderId, ts: &AHashMap<OrderId, UnixNanos>, ms: u64| {
+            ts.get(id)
+                .is_none_or(|t| t.as_u64() + ms * 1_000_000 <= now)
+        };
 
         // Pass opposite side because get_quantity_at_level flips internally
         // (BUY reads asks, SELL reads bids). We want the resting side depth.
-        let qty_ahead = if front {
-            Quantity::zero(size_prec)
-        } else {
-            self.book.get_quantity_at_level(
-                price,
-                OrderCore::opposite_side(order.order_side()),
-                size_prec,
-            )
+        let qty_ahead = match priority_ms {
+            None => self.book.get_quantity_at_level(price, side, size_prec),
+            Some(ms) if self.book_type == BookType::L3_MBO => {
+                let raw: QuantityRaw = self
+                    .book
+                    .get_orders_at_level(price, side)
+                    .iter()
+                    .filter(|o| older(&o.order_id, &self.book_order_ts, ms))
+                    .map(|o| o.size.raw())
+                    .sum();
+                Quantity::from_raw(raw, size_prec)
+            }
+            Some(_) => Quantity::zero(size_prec),
         };
+        let front = priority_ms.is_some();
 
         let client_order_id = order.client_order_id();
 
@@ -628,15 +669,15 @@ impl OrderMatchingEngine {
 
         // L3 books identify orders, so track which specific orders are ahead
         if self.book_type == BookType::L3_MBO {
-            let orders_ahead: IndexMap<OrderId, QuantityRaw> = if front {
-                IndexMap::new()
-            } else {
-                self.book
-                    .get_orders_at_level(price, OrderCore::opposite_side(order.order_side()))
-                    .iter()
-                    .map(|book_order| (book_order.order_id, book_order.size.raw()))
-                    .collect()
-            };
+            let orders_ahead: IndexMap<OrderId, QuantityRaw> = self
+                .book
+                .get_orders_at_level(price, side)
+                .iter()
+                .filter(|o| {
+                    priority_ms.is_none_or(|ms| older(&o.order_id, &self.book_order_ts, ms))
+                })
+                .map(|book_order| (book_order.order_id, book_order.size.raw()))
+                .collect();
             self.queue_ahead_orders
                 .insert(client_order_id, orders_ahead);
         }
@@ -1642,6 +1683,7 @@ impl OrderMatchingEngine {
         }
 
         self.book.apply_delta(delta)?;
+        self.note_book_order(delta);
 
         let is_snapshot = RecordFlag::F_SNAPSHOT.matches(delta.flags);
         let is_last = RecordFlag::F_LAST.matches(delta.flags);
@@ -1700,6 +1742,9 @@ impl OrderMatchingEngine {
         }
 
         self.book.apply_deltas(deltas)?;
+        for delta in &deltas.deltas {
+            self.note_book_order(delta);
+        }
 
         let mut has_snapshot_or_clear = false;
 
@@ -3558,7 +3603,7 @@ impl OrderMatchingEngine {
             && self.config.queue_position
             && let Some(new_price) = refreshed.price()
         {
-            self.snapshot_queue_position(&refreshed, new_price, false);
+            self.snapshot_queue_position(&refreshed, new_price, None);
             self.queue_excess.swap_remove(&refreshed.client_order_id());
         }
     }
@@ -3913,7 +3958,7 @@ impl OrderMatchingEngine {
             self.cancel_order(order, None);
         } else {
             if let Some(price) = order.price() {
-                self.snapshot_queue_position(order, price, self.config.queue_front);
+                self.snapshot_queue_position(order, price, self.config.queue_priority_ms);
             }
 
             // `order` is the caller's copy, so record Maker on the cached order
@@ -12076,6 +12121,15 @@ mod tests {
         config: OrderMatchingEngineConfig,
     ) -> (OrderMatchingEngine, Rc<RefCell<Cache>>) {
         let clock = Rc::new(RefCell::new(VirtualClock::new()));
+        get_queue_engine_clock(instrument, book_type, config, clock)
+    }
+
+    fn get_queue_engine_clock(
+        instrument: InstrumentAny,
+        book_type: BookType,
+        config: OrderMatchingEngineConfig,
+        clock: Rc<RefCell<VirtualClock>>,
+    ) -> (OrderMatchingEngine, Rc<RefCell<Cache>>) {
         let cache = Rc::new(RefCell::new(Cache::default()));
 
         let mut engine = OrderMatchingEngine::new(
@@ -12455,35 +12509,67 @@ mod tests {
     }
 
     #[rstest]
-    #[case::back(false, 0.0)]
-    #[case::front(true, 5.0)]
-    fn test_queue_front_places_a_new_order_ahead_of_its_level(
-        #[case] queue_front: bool,
-        #[case] filled_by_trade: f64,
+    #[case::no_priority(None, 0.0)]
+    #[case::priority(Some(400), 5.0)]
+    fn test_queue_priority_goes_ahead_of_young_orders_only(
+        #[case] queue_priority_ms: Option<u64>,
+        #[case] filled_after_old: f64,
     ) {
         let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
         let instrument_id = instrument.id();
-        let (mut engine, cache) = get_queue_engine_config(
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
+        let (mut engine, cache) = get_queue_engine_clock(
             instrument,
             BookType::L3_MBO,
             OrderMatchingEngineConfig {
                 trade_execution: true,
                 queue_position: true,
-                queue_front,
+                queue_priority_ms,
                 ..Default::default()
             },
+            Rc::clone(&clock),
         );
-        let client_order_id = ClientOrderId::from("O-QUEUE-FRONT");
-        // 10 resting at 100.00 when the order joins.
-        rest_l3_queue_order(&mut engine, Price::from("100.00"), 1, client_order_id);
+        // At 100.00: an order of 10 that arrived at 0 s, one of 7 at 1.8 s.
+        for (id, size, ts) in [(1, "10.000", 0_u64), (2, "7.000", 1_800_000_000)] {
+            let delta = OrderBookDelta::new(
+                instrument_id,
+                BookAction::Add,
+                BookOrder::new(
+                    OrderSide::Sell,
+                    Price::from("100.00"),
+                    Quantity::from(size),
+                    id,
+                ),
+                0,
+                id,
+                UnixNanos::from(ts),
+                UnixNanos::from(ts),
+            );
+            engine.process_order_book_delta(&delta).unwrap();
+        }
+        // Ours arrives at 2 s: with 400 ms priority only the older order is ahead.
+        clock
+            .borrow_mut()
+            .advance_time(UnixNanos::from(2_000_000_000), true);
+        let client_order_id = ClientOrderId::from("O-QUEUE-PRIORITY");
+        let mut order = OrderTestBuilder::new(OrderType::Limit)
+            .instrument_id(instrument_id)
+            .side(OrderSide::Sell)
+            .price(Price::from("100.00"))
+            .quantity(Quantity::from("5.000"))
+            .client_order_id(client_order_id)
+            .submit(true)
+            .build();
+        process_cached_order(&mut engine, &mut order, AccountId::from("SIM-001"));
+        // A trade of 15 takes the older order's 10, then ours if it is next.
         let trade = TradeTick::new(
             instrument_id,
             Price::from("100.00"),
-            Quantity::from("5.000"),
+            Quantity::from("15.000"),
             AggressorSide::Buy,
             TradeId::new("T-1"),
-            UnixNanos::from(2_u64),
-            UnixNanos::from(2_u64),
+            UnixNanos::from(2_100_000_000_u64),
+            UnixNanos::from(2_100_000_000_u64),
         );
         engine.process_trade_tick(&trade);
         let filled = cache
@@ -12492,7 +12578,7 @@ mod tests {
             .unwrap()
             .filled_qty()
             .as_f64();
-        assert_eq!(filled, filled_by_trade);
+        assert_eq!(filled, filled_after_old);
     }
 
     #[rstest]

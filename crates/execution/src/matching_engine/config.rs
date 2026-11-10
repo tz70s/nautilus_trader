@@ -55,11 +55,12 @@ pub struct OrderMatchingEngineConfig {
     /// rejected, so with this off only trades fill resting orders.
     #[builder(default = true)]
     pub book_execution: bool,
-    /// If a new resting order joins the front of its price level, as one
-    /// paying a venue's queue priority fee does, instead of the back. A
+    /// If set, a new resting order goes ahead of the orders at its price
+    /// that arrived within this many milliseconds before it, as one paying a
+    /// venue's queue priority fee does (Hyperliquid's: 400 ms), and stays
+    /// behind older ones. On an L3 book; on others it joins the front. A
     /// modified order still joins the back.
-    #[builder(default)]
-    pub queue_front: bool,
+    pub queue_priority_ms: Option<u64>,
     #[builder(default)]
     pub oto_full_trigger: bool,
     #[builder(default)]
@@ -95,7 +96,7 @@ mod tests {
         assert!(!config.use_market_order_acks);
         assert!(!config.queue_position);
         assert!(config.book_execution);
-        assert!(!config.queue_front);
+        assert_eq!(config.queue_priority_ms, None);
         assert!(!config.oto_full_trigger);
         assert!(!config.defer_option_settlement);
         assert_eq!(config.price_protection_points, None);
