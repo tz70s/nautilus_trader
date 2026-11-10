@@ -351,6 +351,10 @@ pub struct SimulatedVenueConfig {
     /// only when a trade does.
     #[builder(default = true)]
     pub book_execution: bool,
+    /// If a new resting order joins the front of its price level, as one
+    /// paying a venue's queue priority fee does.
+    #[builder(default = false)]
+    pub queue_front: bool,
     /// If one-triggers-other orders wait for the parent to fill completely.
     #[builder(default = false)]
     pub oto_full_trigger: bool,

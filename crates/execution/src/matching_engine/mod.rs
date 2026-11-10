@@ -579,7 +579,9 @@ impl OrderMatchingEngine {
         })
     }
 
-    fn snapshot_queue_position(&mut self, order: &OrderAny, price: Price) {
+    /// Records the queue ahead of `order` at `price`: the level's resting
+    /// size, or none when it joins the `front`.
+    fn snapshot_queue_position(&mut self, order: &OrderAny, price: Price, front: bool) {
         if !self.config.queue_position {
             return;
         }
@@ -587,11 +589,15 @@ impl OrderMatchingEngine {
 
         // Pass opposite side because get_quantity_at_level flips internally
         // (BUY reads asks, SELL reads bids). We want the resting side depth.
-        let qty_ahead = self.book.get_quantity_at_level(
-            price,
-            OrderCore::opposite_side(order.order_side()),
-            size_prec,
-        );
+        let qty_ahead = if front {
+            Quantity::zero(size_prec)
+        } else {
+            self.book.get_quantity_at_level(
+                price,
+                OrderCore::opposite_side(order.order_side()),
+                size_prec,
+            )
+        };
 
         let client_order_id = order.client_order_id();
 
@@ -605,7 +611,7 @@ impl OrderMatchingEngine {
         // these orders separately so fills are blocked until the BBO reaches
         // this price. Only truly behind-BBO prices are pending (BUY below
         // best bid / SELL above best ask); inside-spread and no-book keep 0.
-        if self.book_type == BookType::L1_MBP && qty_ahead.is_zero() {
+        if self.book_type == BookType::L1_MBP && qty_ahead.is_zero() && !front {
             let behind_bbo = match order.order_side() {
                 OrderSide::Buy => self.book.best_bid_price().is_some_and(|bid| price < bid),
                 OrderSide::Sell => self.book.best_ask_price().is_some_and(|ask| price > ask),
@@ -622,12 +628,15 @@ impl OrderMatchingEngine {
 
         // L3 books identify orders, so track which specific orders are ahead
         if self.book_type == BookType::L3_MBO {
-            let orders_ahead: IndexMap<OrderId, QuantityRaw> = self
-                .book
-                .get_orders_at_level(price, OrderCore::opposite_side(order.order_side()))
-                .iter()
-                .map(|book_order| (book_order.order_id, book_order.size.raw()))
-                .collect();
+            let orders_ahead: IndexMap<OrderId, QuantityRaw> = if front {
+                IndexMap::new()
+            } else {
+                self.book
+                    .get_orders_at_level(price, OrderCore::opposite_side(order.order_side()))
+                    .iter()
+                    .map(|book_order| (book_order.order_id, book_order.size.raw()))
+                    .collect()
+            };
             self.queue_ahead_orders
                 .insert(client_order_id, orders_ahead);
         }
@@ -3549,7 +3558,7 @@ impl OrderMatchingEngine {
             && self.config.queue_position
             && let Some(new_price) = refreshed.price()
         {
-            self.snapshot_queue_position(&refreshed, new_price);
+            self.snapshot_queue_position(&refreshed, new_price, false);
             self.queue_excess.swap_remove(&refreshed.client_order_id());
         }
     }
@@ -3904,7 +3913,7 @@ impl OrderMatchingEngine {
             self.cancel_order(order, None);
         } else {
             if let Some(price) = order.price() {
-                self.snapshot_queue_position(order, price);
+                self.snapshot_queue_position(order, price, self.config.queue_front);
             }
 
             // `order` is the caller's copy, so record Maker on the cached order
@@ -12049,14 +12058,25 @@ mod tests {
         book_type: BookType,
         book_execution: bool,
     ) -> (OrderMatchingEngine, Rc<RefCell<Cache>>) {
+        get_queue_engine_config(
+            instrument,
+            book_type,
+            OrderMatchingEngineConfig {
+                trade_execution: true,
+                queue_position: true,
+                book_execution,
+                ..Default::default()
+            },
+        )
+    }
+
+    fn get_queue_engine_config(
+        instrument: InstrumentAny,
+        book_type: BookType,
+        config: OrderMatchingEngineConfig,
+    ) -> (OrderMatchingEngine, Rc<RefCell<Cache>>) {
         let clock = Rc::new(RefCell::new(VirtualClock::new()));
         let cache = Rc::new(RefCell::new(Cache::default()));
-        let config = OrderMatchingEngineConfig {
-            trade_execution: true,
-            queue_position: true,
-            book_execution,
-            ..Default::default()
-        };
 
         let mut engine = OrderMatchingEngine::new(
             instrument,
@@ -12432,6 +12452,47 @@ mod tests {
             engine.queue_ahead_total.get(&client_order_id),
             Some(&(Price::from("100.00").raw(), Quantity::from("8.000").raw())),
         );
+    }
+
+    #[rstest]
+    #[case::back(false, 0.0)]
+    #[case::front(true, 5.0)]
+    fn test_queue_front_places_a_new_order_ahead_of_its_level(
+        #[case] queue_front: bool,
+        #[case] filled_by_trade: f64,
+    ) {
+        let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
+        let instrument_id = instrument.id();
+        let (mut engine, cache) = get_queue_engine_config(
+            instrument,
+            BookType::L3_MBO,
+            OrderMatchingEngineConfig {
+                trade_execution: true,
+                queue_position: true,
+                queue_front,
+                ..Default::default()
+            },
+        );
+        let client_order_id = ClientOrderId::from("O-QUEUE-FRONT");
+        // 10 resting at 100.00 when the order joins.
+        rest_l3_queue_order(&mut engine, Price::from("100.00"), 1, client_order_id);
+        let trade = TradeTick::new(
+            instrument_id,
+            Price::from("100.00"),
+            Quantity::from("5.000"),
+            AggressorSide::Buy,
+            TradeId::new("T-1"),
+            UnixNanos::from(2_u64),
+            UnixNanos::from(2_u64),
+        );
+        engine.process_trade_tick(&trade);
+        let filled = cache
+            .borrow()
+            .order(&client_order_id)
+            .unwrap()
+            .filled_qty()
+            .as_f64();
+        assert_eq!(filled, filled_by_trade);
     }
 
     #[rstest]
