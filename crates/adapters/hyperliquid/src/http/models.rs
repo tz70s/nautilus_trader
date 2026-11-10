@@ -880,6 +880,23 @@ mod tests {
     use super::*;
 
     #[rstest]
+    fn test_priority_grouping_is_a_p_map_for_json_and_signing() {
+        let priority = HyperliquidExchangeGrouping::Priority { p: 3 };
+        assert_eq!(
+            serde_json::to_value(priority).unwrap(),
+            serde_json::json!({"p": 3})
+        );
+        assert_eq!(
+            serde_json::to_value(HyperliquidExchangeGrouping::Na).unwrap(),
+            serde_json::json!("na")
+        );
+        // The action is signed over its named MessagePack encoding.
+        let bytes = rmp_serde::to_vec_named(&priority).unwrap();
+        let back: serde_json::Value = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(back, serde_json::json!({"p": 3}));
+    }
+
+    #[rstest]
     fn test_signature_serialization_and_debug_redaction() {
         let signature = HyperliquidSignature::new(
             "0x1111111111111111111111111111111111111111111111111111111111111111".to_string(),
@@ -1605,6 +1622,10 @@ pub enum HyperliquidExchangeGrouping {
     /// Position-level TP/SL grouping.
     #[serde(rename = "positionTpsl")]
     PositionTpsl,
+    /// Queue priority: an IOC or non-reduce-only ALO order paying `p` (a fee
+    /// rate of p/1e8) goes ahead of the orders resting at its price.
+    #[serde(untagged)]
+    Priority { p: u64 },
 }
 
 /// Order kind specification for the `t` field in exchange endpoint order requests.

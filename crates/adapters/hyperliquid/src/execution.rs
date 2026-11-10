@@ -155,6 +155,15 @@ impl HyperliquidExecutionClient {
         self.pending_tasks.all_finished()
     }
 
+    /// The grouping of a single order: queue priority when
+    /// `SubmitOrder.params["priority"]` is a positive `p`.
+    fn resolve_grouping(params: Option<&Params>) -> HyperliquidExchangeGrouping {
+        match params.and_then(|p| p.get_u64("priority")) {
+            Some(p) if p > 0 => HyperliquidExchangeGrouping::Priority { p },
+            _ => HyperliquidExchangeGrouping::Na,
+        }
+    }
+
     fn resolve_slippage_bps(&self, params: Option<&Params>) -> u32 {
         params
             .and_then(|p| p.get_u64("market_order_slippage_bps"))
@@ -900,6 +909,7 @@ impl ExecutionClient for HyperliquidExecutionClient {
 
         let price_decimals = http_client.get_price_precision_for_symbol(symbol);
         let slippage_bps = self.resolve_slippage_bps(cmd.params.as_ref());
+        let grouping = Self::resolve_grouping(cmd.params.as_ref());
         let mut hyperliquid_order = match order_to_hyperliquid_request_with_optional_decimals(
             &order,
             asset,
@@ -1002,7 +1012,7 @@ impl ExecutionClient for HyperliquidExecutionClient {
 
             let action = HyperliquidExchangeAction::Order {
                 orders: vec![hyperliquid_order],
-                grouping: HyperliquidExchangeGrouping::Na,
+                grouping,
                 builder,
             };
             let rejection_route = PostRejectionRoute::new(
