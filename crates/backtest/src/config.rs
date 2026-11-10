@@ -347,6 +347,10 @@ pub struct SimulatedVenueConfig {
     /// If passive fills account for queue position.
     #[builder(default = false)]
     pub queue_position: bool,
+    /// If a resting maker order fills when the book reaches its price, not
+    /// only when a trade does.
+    #[builder(default = true)]
+    pub book_execution: bool,
     /// If one-triggers-other orders wait for the parent to fill completely.
     #[builder(default = false)]
     pub oto_full_trigger: bool,

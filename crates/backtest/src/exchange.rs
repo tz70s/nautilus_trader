@@ -189,6 +189,7 @@ pub struct SimulatedExchange {
     allow_cash_borrowing: bool,
     frozen_account: bool,
     queue_position: bool,
+    book_execution: bool,
     oto_full_trigger: bool,
     defer_option_settlement: bool,
     price_protection_points: u32,
@@ -279,6 +280,7 @@ impl SimulatedExchange {
             allow_cash_borrowing: config.allow_cash_borrowing,
             frozen_account: config.frozen_account,
             queue_position: config.queue_position,
+            book_execution: config.book_execution,
             oto_full_trigger: config.oto_full_trigger,
             defer_option_settlement: config.defer_option_settlement,
             price_protection_points: config.price_protection_points,
@@ -484,6 +486,7 @@ impl SimulatedExchange {
             .use_reduce_only(self.use_reduce_only)
             .use_market_order_acks(self.use_market_order_acks)
             .queue_position(self.queue_position)
+            .book_execution(self.book_execution)
             .oto_full_trigger(self.oto_full_trigger)
             .defer_option_settlement(self.defer_option_settlement)
             .maybe_price_protection_points(price_protection)

@@ -49,6 +49,12 @@ pub struct OrderMatchingEngineConfig {
     pub use_market_order_acks: bool,
     #[builder(default)]
     pub queue_position: bool,
+    /// If a resting maker order fills when the book reaches its price, not
+    /// only when a trade does. Book data can't tell a taker reaching the
+    /// price from a post-only order that the resting one would have
+    /// rejected, so with this off only trades fill resting orders.
+    #[builder(default = true)]
+    pub book_execution: bool,
     #[builder(default)]
     pub oto_full_trigger: bool,
     #[builder(default)]
@@ -83,6 +89,7 @@ mod tests {
         assert!(config.use_reduce_only);
         assert!(!config.use_market_order_acks);
         assert!(!config.queue_position);
+        assert!(config.book_execution);
         assert!(!config.oto_full_trigger);
         assert!(!config.defer_option_settlement);
         assert_eq!(config.price_protection_points, None);

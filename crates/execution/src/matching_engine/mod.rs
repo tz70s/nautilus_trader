@@ -4986,11 +4986,17 @@ impl OrderMatchingEngine {
                     return;
                 }
 
-                // Check fill model for MAKER orders at the limit price
-                if order
+                let is_maker = order
                     .liquidity_side()
-                    .is_some_and(|liquidity_side| liquidity_side == LiquiditySide::Maker)
-                {
+                    .is_some_and(|liquidity_side| liquidity_side == LiquiditySide::Maker);
+
+                // Without book execution only a trade fills a resting order
+                if is_maker && !self.config.book_execution && self.last_trade_size.is_none() {
+                    return;
+                }
+
+                // Check fill model for MAKER orders at the limit price
+                if is_maker {
                     // For trade execution: check if trade price equals order price
                     // For quote updates: check if bid/ask equals order price
                     let at_limit = if self.last_trade_size.is_some() && self.core.last.is_some() {
@@ -12035,11 +12041,20 @@ mod tests {
         instrument: InstrumentAny,
         book_type: BookType,
     ) -> (OrderMatchingEngine, Rc<RefCell<Cache>>) {
+        get_queue_engine_with(instrument, book_type, true)
+    }
+
+    fn get_queue_engine_with(
+        instrument: InstrumentAny,
+        book_type: BookType,
+        book_execution: bool,
+    ) -> (OrderMatchingEngine, Rc<RefCell<Cache>>) {
         let clock = Rc::new(RefCell::new(VirtualClock::new()));
         let cache = Rc::new(RefCell::new(Cache::default()));
         let config = OrderMatchingEngineConfig {
             trade_execution: true,
             queue_position: true,
+            book_execution,
             ..Default::default()
         };
 
@@ -12417,6 +12432,59 @@ mod tests {
             engine.queue_ahead_total.get(&client_order_id),
             Some(&(Price::from("100.00").raw(), Quantity::from("8.000").raw())),
         );
+    }
+
+    #[rstest]
+    #[case::book_execution(true, true)]
+    #[case::trades_only(false, false)]
+    fn test_book_execution_fills_a_resting_order_when_the_book_crosses_it(
+        #[case] book_execution: bool,
+        #[case] filled_by_book: bool,
+    ) {
+        let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
+        let instrument_id = instrument.id();
+        let (mut engine, cache) =
+            get_queue_engine_with(instrument, BookType::L3_MBO, book_execution);
+        let client_order_id = ClientOrderId::from("O-BOOK-EXECUTION");
+        rest_l3_queue_order(&mut engine, Price::from("100.00"), 1, client_order_id);
+
+        // The order ahead leaves, then a bid comes to the resting ask's price.
+        for (action, side, id, sequence) in [
+            (BookAction::Delete, OrderSide::Sell, 1, 2),
+            (BookAction::Add, OrderSide::Buy, 9, 3),
+        ] {
+            let delta = OrderBookDelta::new(
+                instrument_id,
+                action,
+                BookOrder::new(side, Price::from("100.00"), Quantity::from("10.000"), id),
+                0,
+                sequence,
+                UnixNanos::from(sequence),
+                UnixNanos::from(sequence),
+            );
+            engine.process_order_book_delta(&delta).unwrap();
+        }
+        let filled = |cache: &Rc<RefCell<Cache>>| {
+            cache
+                .borrow()
+                .order(&client_order_id)
+                .unwrap()
+                .filled_qty()
+                .as_f64()
+        };
+        assert_eq!(filled(&cache) > 0.0, filled_by_book);
+
+        let trade = TradeTick::new(
+            instrument_id,
+            Price::from("100.00"),
+            Quantity::from("5.000"),
+            AggressorSide::Buy,
+            TradeId::new("T-1"),
+            UnixNanos::from(4_u64),
+            UnixNanos::from(4_u64),
+        );
+        engine.process_trade_tick(&trade);
+        assert_eq!(filled(&cache), 5.0);
     }
 
     #[rstest]
