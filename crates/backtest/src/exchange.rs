@@ -38,7 +38,9 @@ use nautilus_core::{
 use nautilus_execution::{
     matching_core::RestingOrder,
     matching_engine::{
-        OrderMatchingEngine, config::OrderMatchingEngineConfig, inflight::InflightOrders,
+        OrderMatchingEngine,
+        config::{InsertBefore, OrderMatchingEngineConfig},
+        inflight::InflightOrders,
     },
     models::{
         fee::FeeModelHandle,
@@ -191,6 +193,7 @@ pub struct SimulatedExchange {
     queue_position: bool,
     book_execution: bool,
     queue_priority_ms: Option<u64>,
+    insert_before: Option<InsertBefore>,
     oto_full_trigger: bool,
     defer_option_settlement: bool,
     price_protection_points: u32,
@@ -283,6 +286,7 @@ impl SimulatedExchange {
             queue_position: config.queue_position,
             book_execution: config.book_execution,
             queue_priority_ms: config.queue_priority_ms,
+            insert_before: config.insert_before,
             oto_full_trigger: config.oto_full_trigger,
             defer_option_settlement: config.defer_option_settlement,
             price_protection_points: config.price_protection_points,
@@ -490,6 +494,7 @@ impl SimulatedExchange {
             .queue_position(self.queue_position)
             .book_execution(self.book_execution)
             .maybe_queue_priority_ms(self.queue_priority_ms)
+            .maybe_insert_before(self.insert_before.clone())
             .oto_full_trigger(self.oto_full_trigger)
             .defer_option_settlement(self.defer_option_settlement)
             .maybe_price_protection_points(price_protection)

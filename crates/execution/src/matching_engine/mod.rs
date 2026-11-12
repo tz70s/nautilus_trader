@@ -596,6 +596,9 @@ impl OrderMatchingEngine {
             }
             BookAction::Delete => {
                 self.book_order_ts.remove(&delta.order.order_id);
+                if let Some(inserts) = &self.config.insert_before {
+                    inserts.0.borrow_mut().remove(&delta.order.order_id);
+                }
             }
             BookAction::Clear => self.book_order_ts.clear(),
             BookAction::Update => {}
@@ -617,9 +620,15 @@ impl OrderMatchingEngine {
         let size_prec = self.instrument.size_precision();
         let side = OrderCore::opposite_side(order.order_side());
         let now = self.clock.borrow().timestamp_ns().as_u64();
+        // Ahead: what arrived over `ms` before now, and what itself went
+        // ahead of others since (a priority order earlier than this one).
+        let inserts = self.config.insert_before.clone();
         let older = |id: &OrderId, ts: &AHashMap<OrderId, UnixNanos>, ms: u64| {
             ts.get(id)
                 .is_none_or(|t| t.as_u64() + ms * 1_000_000 <= now)
+                || inserts
+                    .as_ref()
+                    .is_some_and(|i| i.0.borrow().contains_key(id))
         };
 
         // Pass opposite side because get_quantity_at_level flips internally
@@ -1000,7 +1009,11 @@ impl OrderMatchingEngine {
     }
 
     fn adjust_queue_for_delta(&mut self, delta: &OrderBookDelta) {
-        if delta.action == BookAction::Delete {
+        if delta.action == BookAction::Add {
+            if self.is_order_granular_delta(delta.flags) {
+                self.advance_l3_queue_on_insert(&delta.order);
+            }
+        } else if delta.action == BookAction::Delete {
             if self.is_order_granular_delta(delta.flags) {
                 self.advance_l3_queue_on_delete(delta.order.order_id);
             } else {
@@ -1051,6 +1064,28 @@ impl OrderMatchingEngine {
         self.book_type == BookType::L3_MBO
             && !RecordFlag::F_TOB.matches(flags)
             && !RecordFlag::F_MBP.matches(flags)
+    }
+
+    /// A book order that went ahead of another (`insert_before`) goes ahead
+    /// of each own order that one is ahead of, just before it.
+    fn advance_l3_queue_on_insert(&mut self, book_order: &BookOrder) {
+        let Some(before) = self
+            .config
+            .insert_before
+            .as_ref()
+            .and_then(|i| i.0.borrow().get(&book_order.order_id).copied())
+        else {
+            return;
+        };
+        for (client_order_id, orders_ahead) in &mut self.queue_ahead_orders {
+            let Some(index) = orders_ahead.get_index_of(&before) else {
+                continue;
+            };
+            orders_ahead.shift_insert(index, book_order.order_id, book_order.size.raw());
+            if let Some((_, ahead_raw)) = self.queue_ahead_total.get_mut(client_order_id) {
+                *ahead_raw = ahead_raw.saturating_add(book_order.size.raw());
+            }
+        }
     }
 
     fn advance_l3_queue_on_delete(&mut self, book_order_id: OrderId) {
@@ -12579,6 +12614,95 @@ mod tests {
             .filled_qty()
             .as_f64();
         assert_eq!(filled, filled_after_old);
+    }
+
+    #[rstest]
+    // Order 2 (7 at 1.8 s) itself went ahead of order 1: it stays ahead of ours.
+    #[case::earlier_priority_order_stays_ahead(&[(2, 1)], None, 0.0)]
+    // Order 3 (4 at 2.05 s) goes ahead of order 1, which is ahead of ours.
+    #[case::insert_ahead_of_an_order_ahead(&[(3, 1)], Some(3), 1.0)]
+    // Order 3 goes ahead of order 2, which ours went ahead of: still behind ours.
+    #[case::insert_behind_ours(&[(3, 2)], Some(3), 5.0)]
+    fn test_queue_priority_inserts_go_ahead_of_the_order_they_name(
+        #[case] inserts: &[(u64, u64)],
+        #[case] later: Option<u64>,
+        #[case] filled: f64,
+    ) {
+        let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
+        let instrument_id = instrument.id();
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
+        let insert_before = crate::matching_engine::config::InsertBefore::default();
+        insert_before.0.borrow_mut().extend(inserts.iter().copied());
+        let (mut engine, cache) = get_queue_engine_clock(
+            instrument,
+            BookType::L3_MBO,
+            OrderMatchingEngineConfig {
+                trade_execution: true,
+                queue_position: true,
+                queue_priority_ms: Some(400),
+                insert_before: Some(insert_before),
+                ..Default::default()
+            },
+            Rc::clone(&clock),
+        );
+        let add = |id: u64, size: &str, ts: u64| {
+            OrderBookDelta::new(
+                instrument_id,
+                BookAction::Add,
+                BookOrder::new(
+                    OrderSide::Sell,
+                    Price::from("100.00"),
+                    Quantity::from(size),
+                    id,
+                ),
+                0,
+                id,
+                UnixNanos::from(ts),
+                UnixNanos::from(ts),
+            )
+        };
+        engine
+            .process_order_book_delta(&add(1, "10.000", 0))
+            .unwrap();
+        engine
+            .process_order_book_delta(&add(2, "7.000", 1_800_000_000))
+            .unwrap();
+        clock
+            .borrow_mut()
+            .advance_time(UnixNanos::from(2_000_000_000), true);
+        let client_order_id = ClientOrderId::from("O-INSERT-BEFORE");
+        let mut order = OrderTestBuilder::new(OrderType::Limit)
+            .instrument_id(instrument_id)
+            .side(OrderSide::Sell)
+            .price(Price::from("100.00"))
+            .quantity(Quantity::from("5.000"))
+            .client_order_id(client_order_id)
+            .submit(true)
+            .build();
+        process_cached_order(&mut engine, &mut order, AccountId::from("SIM-001"));
+        if let Some(id) = later {
+            engine
+                .process_order_book_delta(&add(id, "4.000", 2_050_000_000))
+                .unwrap();
+        }
+        // A trade of 15 at 2.1 s.
+        let trade = TradeTick::new(
+            instrument_id,
+            Price::from("100.00"),
+            Quantity::from("15.000"),
+            AggressorSide::Buy,
+            TradeId::new("T-1"),
+            UnixNanos::from(2_100_000_000_u64),
+            UnixNanos::from(2_100_000_000_u64),
+        );
+        engine.process_trade_tick(&trade);
+        let got = cache
+            .borrow()
+            .order(&client_order_id)
+            .unwrap()
+            .filled_qty()
+            .as_f64();
+        assert_eq!(got, filled);
     }
 
     #[rstest]

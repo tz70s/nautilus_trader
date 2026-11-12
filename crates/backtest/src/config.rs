@@ -29,6 +29,7 @@ use nautilus_core::{UUID4, UnixNanos, string::secret::SecretString};
 use nautilus_data::engine::config::DataEngineConfig;
 use nautilus_execution::{
     engine::config::ExecutionEngineConfig,
+    matching_engine::config::InsertBefore,
     models::{
         fee::{FeeModelAny, FeeModelHandle},
         fill::{FillModelAny, FillModelHandle},
@@ -355,6 +356,9 @@ pub struct SimulatedVenueConfig {
     /// arrived within this many milliseconds before it, as one paying a
     /// venue's queue priority fee does (Hyperliquid's: 400 ms).
     pub queue_priority_ms: Option<u64>,
+    /// With `queue_priority_ms` on an L3 book, the book orders that went
+    /// ahead of others, filled by the replay (see [`InsertBefore`]).
+    pub insert_before: Option<InsertBefore>,
     /// If one-triggers-other orders wait for the parent to fill completely.
     #[builder(default = false)]
     pub oto_full_trigger: bool,

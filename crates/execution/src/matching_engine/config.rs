@@ -13,7 +13,25 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
+use std::{cell::RefCell, fmt, rc::Rc};
+
+use ahash::AHashMap;
+use nautilus_model::data::order::OrderId;
 use serde::{Deserialize, Serialize};
+
+/// Each L3 book order that a venue placed ahead of an earlier order at its
+/// price (Hyperliquid's queue priority, its `insert_before`), by its id: the
+/// order it went ahead of. A book delta can't say so, so the replay that
+/// streams the deltas fills this beside them, and the matching engine drops an
+/// order's entry once it leaves the book.
+#[derive(Clone, Default)]
+pub struct InsertBefore(pub Rc<RefCell<AHashMap<OrderId, OrderId>>>);
+
+impl fmt::Debug for InsertBefore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "InsertBefore({} orders)", self.0.borrow().len())
+    }
+}
 
 /// Configuration for `OrderMatchingEngine` instances.
 ///
@@ -61,6 +79,12 @@ pub struct OrderMatchingEngineConfig {
     /// behind older ones. On an L3 book; on others it joins the front. A
     /// modified order still joins the back.
     pub queue_priority_ms: Option<u64>,
+    /// With `queue_priority_ms` on an L3 book, the book orders that went
+    /// ahead of others: one that went ahead of an order ahead of an own order
+    /// is ahead of it too, and one that arrived within `queue_priority_ms`
+    /// before an own order stays ahead of it.
+    #[serde(skip)]
+    pub insert_before: Option<InsertBefore>,
     #[builder(default)]
     pub oto_full_trigger: bool,
     #[builder(default)]
