@@ -19,17 +19,43 @@ use ahash::AHashMap;
 use nautilus_model::data::order::OrderId;
 use serde::{Deserialize, Serialize};
 
-/// Each L3 book order that a venue placed ahead of an earlier order at its
-/// price (Hyperliquid's queue priority, its `insert_before`), by its id: the
-/// order it went ahead of. A book delta can't say so, so the replay that
-/// streams the deltas fills this beside them, and the matching engine drops an
-/// order's entry once it leaves the book.
+/// Queue priority by rate, as Hyperliquid's: among orders less than
+/// `queue_priority_ms` old, a higher rate goes ahead, and an equal one keeps
+/// arrival order.
+///
+/// `orders` holds each L3 book order that the venue placed ahead of an
+/// earlier order at its price (its `insert_before`), by its id: the order it
+/// went ahead of. A book delta can't say so, so the replay that streams the
+/// deltas fills this beside them, and the matching engine drops an order's
+/// entry once it leaves the book. Those orders are taken to pay
+/// `inserted_rate`, others none; own orders pay `own_rate`.
 #[derive(Clone, Default)]
-pub struct InsertBefore(pub Rc<RefCell<AHashMap<OrderId, OrderId>>>);
+pub struct InsertBefore {
+    pub orders: Rc<RefCell<AHashMap<OrderId, OrderId>>>,
+    pub own_rate: u64,
+    pub inserted_rate: u64,
+}
+
+impl InsertBefore {
+    #[must_use]
+    pub fn rate(&self, id: &OrderId) -> u64 {
+        if self.orders.borrow().contains_key(id) {
+            self.inserted_rate
+        } else {
+            0
+        }
+    }
+}
 
 impl fmt::Debug for InsertBefore {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "InsertBefore({} orders)", self.0.borrow().len())
+        write!(
+            f,
+            "InsertBefore({} orders, own rate {}, inserted rate {})",
+            self.orders.borrow().len(),
+            self.own_rate,
+            self.inserted_rate
+        )
     }
 }
 
@@ -79,10 +105,11 @@ pub struct OrderMatchingEngineConfig {
     /// behind older ones. On an L3 book; on others it joins the front. A
     /// modified order still joins the back.
     pub queue_priority_ms: Option<u64>,
-    /// With `queue_priority_ms` on an L3 book, the book orders that went
-    /// ahead of others: one that went ahead of an order ahead of an own order
-    /// is ahead of it too, and one that arrived within `queue_priority_ms`
-    /// before an own order stays ahead of it.
+    /// With `queue_priority_ms` on an L3 book, the priority rates: a book
+    /// order that went ahead of an order ahead of an own order is ahead of it
+    /// too; one less than `queue_priority_ms` older than an own order stays
+    /// ahead of it at a rate at least the own one; and one arriving while an
+    /// own order is that young goes ahead of it at a higher rate.
     #[serde(skip)]
     pub insert_before: Option<InsertBefore>,
     #[builder(default)]

@@ -146,6 +146,8 @@ pub struct OrderMatchingEngine {
     queue_excess: IndexMap<ClientOrderId, QuantityRaw>,
     /// When each order of an L3 book arrived, for `queue_priority_ms`.
     book_order_ts: AHashMap<OrderId, UnixNanos>,
+    /// When and on which side each own order joined its queue.
+    queue_placed: AHashMap<ClientOrderId, (u64, OrderSide)>,
     queue_id_scratch: Vec<ClientOrderId>,
     queue_pending_scratch: Vec<(ClientOrderId, PriceRaw)>,
     queue_stale_scratch: Vec<ClientOrderId>,
@@ -247,6 +249,7 @@ impl OrderMatchingEngine {
             queue_ids_by_price: IndexMap::new(),
             queue_excess: IndexMap::new(),
             book_order_ts: AHashMap::new(),
+            queue_placed: AHashMap::new(),
             queue_id_scratch: Vec::new(),
             queue_pending_scratch: Vec::new(),
             queue_stale_scratch: Vec::new(),
@@ -320,6 +323,7 @@ impl OrderMatchingEngine {
         self.queue_pending.clear();
         self.queue_ahead_orders.clear();
         self.book_order_ts.clear();
+        self.queue_placed.clear();
         self.queue_ahead_total.clear();
         self.queue_snapshot_in_progress = false;
         self.queue_ids_by_price.clear();
@@ -597,7 +601,7 @@ impl OrderMatchingEngine {
             BookAction::Delete => {
                 self.book_order_ts.remove(&delta.order.order_id);
                 if let Some(inserts) = &self.config.insert_before {
-                    inserts.0.borrow_mut().remove(&delta.order.order_id);
+                    inserts.orders.borrow_mut().remove(&delta.order.order_id);
                 }
             }
             BookAction::Clear => self.book_order_ts.clear(),
@@ -620,15 +624,13 @@ impl OrderMatchingEngine {
         let size_prec = self.instrument.size_precision();
         let side = OrderCore::opposite_side(order.order_side());
         let now = self.clock.borrow().timestamp_ns().as_u64();
-        // Ahead: what arrived over `ms` before now, and what itself went
-        // ahead of others since (a priority order earlier than this one).
+        // Ahead: what arrived over `ms` before now, and what arrived since at
+        // a priority rate at least this one's.
         let inserts = self.config.insert_before.clone();
         let older = |id: &OrderId, ts: &AHashMap<OrderId, UnixNanos>, ms: u64| {
             ts.get(id)
                 .is_none_or(|t| t.as_u64() + ms * 1_000_000 <= now)
-                || inserts
-                    .as_ref()
-                    .is_some_and(|i| i.0.borrow().contains_key(id))
+                || inserts.as_ref().is_some_and(|i| i.rate(id) >= i.own_rate)
         };
 
         // Pass opposite side because get_quantity_at_level flips internally
@@ -675,6 +677,8 @@ impl OrderMatchingEngine {
 
         self.queue_ahead_total
             .insert(client_order_id, (price.raw(), qty_ahead.raw()));
+        self.queue_placed
+            .insert(client_order_id, (now, order.order_side()));
 
         // L3 books identify orders, so track which specific orders are ahead
         if self.book_type == BookType::L3_MBO {
@@ -699,6 +703,7 @@ impl OrderMatchingEngine {
             .shift_remove(&client_order_id)
             .map(|(price_raw, _)| price_raw);
         self.queue_ahead_orders.shift_remove(&client_order_id);
+        self.queue_placed.remove(&client_order_id);
         self.queue_excess.shift_remove(&client_order_id);
 
         for price_raw in [pending_price, ahead_price].into_iter().flatten() {
@@ -1066,25 +1071,40 @@ impl OrderMatchingEngine {
             && !RecordFlag::F_MBP.matches(flags)
     }
 
-    /// A book order that went ahead of another (`insert_before`) goes ahead
-    /// of each own order that one is ahead of, just before it.
+    /// A new book order goes ahead of each own order at its price and side
+    /// that is younger than `queue_priority_ms` if its priority rate is
+    /// higher, and otherwise of each own order that the order it went ahead
+    /// of (`insert_before`) is ahead of, just before that one.
     fn advance_l3_queue_on_insert(&mut self, book_order: &BookOrder) {
-        let Some(before) = self
-            .config
-            .insert_before
-            .as_ref()
-            .and_then(|i| i.0.borrow().get(&book_order.order_id).copied())
+        let (Some(inserts), Some(ms)) = (&self.config.insert_before, self.config.queue_priority_ms)
         else {
             return;
         };
+        let before = inserts.orders.borrow().get(&book_order.order_id).copied();
+        let outranks = inserts.rate(&book_order.order_id) > inserts.own_rate;
+        let now = self.clock.borrow().timestamp_ns().as_u64();
+        let price_raw = book_order.price.raw();
         for (client_order_id, orders_ahead) in &mut self.queue_ahead_orders {
-            let Some(index) = orders_ahead.get_index_of(&before) else {
+            let Some((order_price_raw, ahead_raw)) =
+                self.queue_ahead_total.get_mut(client_order_id)
+            else {
                 continue;
             };
+            let young_rival = outranks
+                && *order_price_raw == price_raw
+                && self
+                    .queue_placed
+                    .get(client_order_id)
+                    .is_some_and(|&(ts, side)| {
+                        Some(side) == book_order.side && now < ts + ms * 1_000_000
+                    });
+            let index = match before.and_then(|b| orders_ahead.get_index_of(&b)) {
+                Some(index) => index,
+                None if young_rival => orders_ahead.len(),
+                None => continue,
+            };
             orders_ahead.shift_insert(index, book_order.order_id, book_order.size.raw());
-            if let Some((_, ahead_raw)) = self.queue_ahead_total.get_mut(client_order_id) {
-                *ahead_raw = ahead_raw.saturating_add(book_order.size.raw());
-            }
+            *ahead_raw = ahead_raw.saturating_add(book_order.size.raw());
         }
     }
 
@@ -12617,13 +12637,20 @@ mod tests {
     }
 
     #[rstest]
-    // Order 2 (7 at 1.8 s) itself went ahead of order 1: it stays ahead of ours.
-    #[case::earlier_priority_order_stays_ahead(&[(2, 1)], None, 0.0)]
+    // Book priority orders pay rate 3. Order 2 (7 at 1.8 s) itself went ahead
+    // of order 1: at an equal rate it stays ahead of ours.
+    #[case::earlier_priority_order_stays_ahead(3, &[(2, 1)], None, 0.0)]
+    // At a higher rate ours goes ahead of it too.
+    #[case::higher_rate_goes_ahead_of_it(4, &[(2, 1)], None, 5.0)]
     // Order 3 (4 at 2.05 s) goes ahead of order 1, which is ahead of ours.
-    #[case::insert_ahead_of_an_order_ahead(&[(3, 1)], Some(3), 1.0)]
-    // Order 3 goes ahead of order 2, which ours went ahead of: still behind ours.
-    #[case::insert_behind_ours(&[(3, 2)], Some(3), 5.0)]
+    #[case::insert_ahead_of_an_order_ahead(3, &[(3, 1)], Some(3), 1.0)]
+    // Order 3 goes ahead of order 2, which ours went ahead of: at an equal
+    // rate it stays behind ours.
+    #[case::insert_behind_ours(3, &[(3, 2)], Some(3), 5.0)]
+    // At a higher rate than ours it goes ahead while ours is young.
+    #[case::higher_rate_insert_goes_ahead(2, &[(3, 2)], Some(3), 1.0)]
     fn test_queue_priority_inserts_go_ahead_of_the_order_they_name(
+        #[case] own_rate: u64,
         #[case] inserts: &[(u64, u64)],
         #[case] later: Option<u64>,
         #[case] filled: f64,
@@ -12631,8 +12658,15 @@ mod tests {
         let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
         let instrument_id = instrument.id();
         let clock = Rc::new(RefCell::new(VirtualClock::new()));
-        let insert_before = crate::matching_engine::config::InsertBefore::default();
-        insert_before.0.borrow_mut().extend(inserts.iter().copied());
+        let insert_before = crate::matching_engine::config::InsertBefore {
+            own_rate,
+            inserted_rate: 3,
+            ..Default::default()
+        };
+        insert_before
+            .orders
+            .borrow_mut()
+            .extend(inserts.iter().copied());
         let (mut engine, cache) = get_queue_engine_clock(
             instrument,
             BookType::L3_MBO,
