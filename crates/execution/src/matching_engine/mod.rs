@@ -89,6 +89,17 @@ use crate::{
     trailing::{store_trailing_stop_activation, trailing_stop_calculate},
 };
 
+/// An own order's place in its queue: when it joined, its side and price,
+/// its priority rate, and its rank among the own orders at its price.
+#[derive(Debug, Clone, Copy)]
+struct QueuePlaced {
+    ts: u64,
+    side: OrderSide,
+    price_raw: PriceRaw,
+    rate: u64,
+    rank: i64,
+}
+
 /// An order matching engine for a single market.
 pub struct OrderMatchingEngine {
     /// The venue for the matching engine.
@@ -144,10 +155,11 @@ pub struct OrderMatchingEngine {
     queue_snapshot_in_progress: bool,
     queue_ids_by_price: IndexMap<PriceRaw, IndexSet<ClientOrderId>>,
     queue_excess: IndexMap<ClientOrderId, QuantityRaw>,
-    /// When each order of an L3 book arrived, for `queue_priority_ms`.
-    book_order_ts: AHashMap<OrderId, UnixNanos>,
-    /// When and on which side each own order joined its queue.
-    queue_placed: AHashMap<ClientOrderId, (u64, OrderSide)>,
+    /// When each order of an L3 book arrived and at which price, for
+    /// `queue_priority_ms`; a snapshot's orders at 0, of unknown age.
+    book_order_ts: AHashMap<OrderId, (UnixNanos, PriceRaw)>,
+    queue_placed: AHashMap<ClientOrderId, QueuePlaced>,
+    queue_rank_next: i64,
     queue_id_scratch: Vec<ClientOrderId>,
     queue_pending_scratch: Vec<(ClientOrderId, PriceRaw)>,
     queue_stale_scratch: Vec<ClientOrderId>,
@@ -250,6 +262,7 @@ impl OrderMatchingEngine {
             queue_excess: IndexMap::new(),
             book_order_ts: AHashMap::new(),
             queue_placed: AHashMap::new(),
+            queue_rank_next: 0,
             queue_id_scratch: Vec::new(),
             queue_pending_scratch: Vec::new(),
             queue_stale_scratch: Vec::new(),
@@ -324,6 +337,7 @@ impl OrderMatchingEngine {
         self.queue_ahead_orders.clear();
         self.book_order_ts.clear();
         self.queue_placed.clear();
+        self.queue_rank_next = 0;
         self.queue_ahead_total.clear();
         self.queue_snapshot_in_progress = false;
         self.queue_ids_by_price.clear();
@@ -590,28 +604,56 @@ impl OrderMatchingEngine {
 
     /// Keeps when each order of an L3 book arrived, for `queue_priority_ms`.
     fn note_book_order(&mut self, delta: &OrderBookDelta) {
-        if self.book_type != BookType::L3_MBO || self.config.queue_priority_ms.is_none() {
+        let Some(ms) = self.config.queue_priority_ms else {
+            return;
+        };
+        if self.book_type != BookType::L3_MBO {
             return;
         }
+        let id = delta.order.order_id;
+        let price_raw = delta.order.price.raw();
         match delta.action {
-            BookAction::Add => {
+            BookAction::Add if RecordFlag::F_SNAPSHOT.matches(delta.flags) => {
                 self.book_order_ts
-                    .insert(delta.order.order_id, delta.ts_event);
+                    .entry(id)
+                    .or_insert((UnixNanos::default(), price_raw));
             }
-            BookAction::Delete => {
-                self.book_order_ts.remove(&delta.order.order_id);
-                if let Some(inserts) = &self.config.insert_before {
-                    inserts.orders.borrow_mut().remove(&delta.order.order_id);
+            BookAction::Add => {
+                self.book_order_ts.insert(id, (delta.ts_event, price_raw));
+            }
+            // An order moved to another price is a new one there, at no rate
+            // (a modify carries none).
+            BookAction::Update => {
+                let moved = self
+                    .book_order_ts
+                    .get(&id)
+                    .is_some_and(|&(_, p)| p != price_raw);
+                if moved {
+                    self.book_order_ts.insert(id, (delta.ts_event, price_raw));
+                    if let Some(inserts) = &self.config.insert_before {
+                        inserts.remove(&id);
+                    }
                 }
             }
-            BookAction::Clear => self.book_order_ts.clear(),
-            BookAction::Update => {}
+            BookAction::Delete => {
+                self.book_order_ts.remove(&id);
+                if let Some(inserts) = &self.config.insert_before {
+                    inserts.remove(&id);
+                }
+            }
+            // The orders of the snapshot that follows keep their arrival
+            // times if they are still young.
+            BookAction::Clear => {
+                let now = delta.ts_event.as_u64();
+                self.book_order_ts
+                    .retain(|_, (ts, _)| ts.as_u64() + ms * 1_000_000 > now);
+            }
         }
     }
 
     /// Records the queue ahead of `order` at `price`: the level's resting
     /// orders, or with `priority_ms` only those that arrived more than that
-    /// long before now (none off an L3 book).
+    /// long before now or at a rate at least the order's (none off an L3 book).
     fn snapshot_queue_position(
         &mut self,
         order: &OrderAny,
@@ -624,13 +666,13 @@ impl OrderMatchingEngine {
         let size_prec = self.instrument.size_precision();
         let side = OrderCore::opposite_side(order.order_side());
         let now = self.clock.borrow().timestamp_ns().as_u64();
-        // Ahead: what arrived over `ms` before now, and what arrived since at
-        // a priority rate at least this one's.
         let inserts = self.config.insert_before.clone();
-        let older = |id: &OrderId, ts: &AHashMap<OrderId, UnixNanos>, ms: u64| {
+        // Without rates a priority order outranks every young one.
+        let rate = priority_ms.map_or(0, |_| inserts.as_ref().map_or(u64::MAX, |i| i.own_rate));
+        let ahead = |id: &OrderId, ts: &AHashMap<OrderId, (UnixNanos, PriceRaw)>, ms: u64| {
             ts.get(id)
-                .is_none_or(|t| t.as_u64() + ms * 1_000_000 <= now)
-                || inserts.as_ref().is_some_and(|i| i.rate(id) >= i.own_rate)
+                .is_none_or(|(t, _)| t.as_u64() + ms * 1_000_000 <= now)
+                || inserts.as_ref().is_some_and(|i| i.rate(id) >= rate)
         };
 
         // Pass opposite side because get_quantity_at_level flips internally
@@ -642,7 +684,7 @@ impl OrderMatchingEngine {
                     .book
                     .get_orders_at_level(price, side)
                     .iter()
-                    .filter(|o| older(&o.order_id, &self.book_order_ts, ms))
+                    .filter(|o| ahead(&o.order_id, &self.book_order_ts, ms))
                     .map(|o| o.size.raw())
                     .sum();
                 Quantity::from_raw(raw, size_prec)
@@ -677,8 +719,14 @@ impl OrderMatchingEngine {
 
         self.queue_ahead_total
             .insert(client_order_id, (price.raw(), qty_ahead.raw()));
-        self.queue_placed
-            .insert(client_order_id, (now, order.order_side()));
+        let placed = QueuePlaced {
+            ts: now,
+            side: order.order_side(),
+            price_raw: price.raw(),
+            rate,
+            rank: self.queue_rank(order.order_side(), price.raw(), rate, now, priority_ms),
+        };
+        self.queue_placed.insert(client_order_id, placed);
 
         // L3 books identify orders, so track which specific orders are ahead
         if self.book_type == BookType::L3_MBO {
@@ -687,12 +735,49 @@ impl OrderMatchingEngine {
                 .get_orders_at_level(price, side)
                 .iter()
                 .filter(|o| {
-                    priority_ms.is_none_or(|ms| older(&o.order_id, &self.book_order_ts, ms))
+                    priority_ms.is_none_or(|ms| ahead(&o.order_id, &self.book_order_ts, ms))
                 })
                 .map(|book_order| (book_order.order_id, book_order.size.raw()))
                 .collect();
             self.queue_ahead_orders
                 .insert(client_order_id, orders_ahead);
+        }
+    }
+
+    /// A new own order's rank among the own orders at its price (lower is
+    /// ahead), which orders those level with the same size ahead: behind
+    /// the others, unless with `priority_ms` it outranks young ones, when it
+    /// goes just ahead of them.
+    fn queue_rank(
+        &mut self,
+        side: OrderSide,
+        price_raw: PriceRaw,
+        rate: u64,
+        now: u64,
+        priority_ms: Option<u64>,
+    ) -> i64 {
+        const GAP: i64 = 1 << 32;
+        let level = self
+            .queue_placed
+            .values()
+            .filter(|q| q.side == side && q.price_raw == price_raw);
+        let jumped = |q: &QueuePlaced| {
+            priority_ms.is_some_and(|ms| q.rate < rate && now < q.ts + ms * 1_000_000)
+        };
+        let kept = level.clone().filter(|q| !jumped(q)).map(|q| q.rank).max();
+        let first_jumped = level
+            .filter(|q| jumped(q) && kept.is_none_or(|k| q.rank > k))
+            .map(|q| q.rank)
+            .min();
+        match first_jumped {
+            Some(first) => {
+                let before = kept.unwrap_or(first - GAP);
+                before + (first - before) / 2
+            }
+            None => {
+                self.queue_rank_next += GAP;
+                self.queue_rank_next
+            }
         }
     }
 
@@ -800,7 +885,12 @@ impl OrderMatchingEngine {
         }
 
         // Sort by queue position (earliest first) for shared budget allocation
-        entries.sort_by_key(|&(_, ahead, _)| ahead);
+        entries.sort_by_key(|&(id, ahead, _)| {
+            (
+                ahead,
+                self.queue_placed.get(&id).map_or(i64::MAX, |q| q.rank),
+            )
+        });
 
         let mut remaining = trade_size_raw;
         let mut prev_position: QuantityRaw = 0;
@@ -1071,17 +1161,17 @@ impl OrderMatchingEngine {
             && !RecordFlag::F_MBP.matches(flags)
     }
 
-    /// A new book order goes ahead of each own order at its price and side
-    /// that is younger than `queue_priority_ms` if its priority rate is
-    /// higher, and otherwise of each own order that the order it went ahead
-    /// of (`insert_before`) is ahead of, just before that one.
+    /// A new book order goes ahead of each own order that the order it went
+    /// ahead of (`insert_before`) is ahead of, just before that one; and of
+    /// each own order at its price and side younger than `queue_priority_ms`
+    /// at a lower rate.
     fn advance_l3_queue_on_insert(&mut self, book_order: &BookOrder) {
         let (Some(inserts), Some(ms)) = (&self.config.insert_before, self.config.queue_priority_ms)
         else {
             return;
         };
         let before = inserts.orders.borrow().get(&book_order.order_id).copied();
-        let outranks = inserts.rate(&book_order.order_id) > inserts.own_rate;
+        let rate = inserts.rate(&book_order.order_id);
         let now = self.clock.borrow().timestamp_ns().as_u64();
         let price_raw = book_order.price.raw();
         for (client_order_id, orders_ahead) in &mut self.queue_ahead_orders {
@@ -1090,17 +1180,13 @@ impl OrderMatchingEngine {
             else {
                 continue;
             };
-            let young_rival = outranks
-                && *order_price_raw == price_raw
-                && self
-                    .queue_placed
-                    .get(client_order_id)
-                    .is_some_and(|&(ts, side)| {
-                        Some(side) == book_order.side && now < ts + ms * 1_000_000
-                    });
+            let outranks = *order_price_raw == price_raw
+                && self.queue_placed.get(client_order_id).is_some_and(|q| {
+                    Some(q.side) == book_order.side && rate > q.rate && now < q.ts + ms * 1_000_000
+                });
             let index = match before.and_then(|b| orders_ahead.get_index_of(&b)) {
                 Some(index) => index,
-                None if young_rival => orders_ahead.len(),
+                None if outranks => orders_ahead.len(),
                 None => continue,
             };
             orders_ahead.shift_insert(index, book_order.order_id, book_order.size.raw());
@@ -3649,9 +3735,12 @@ impl OrderMatchingEngine {
             return;
         };
 
-        // Skip queue reset on rejected modifies to preserve accrued position
+        // Skip queue reset on rejected modifies to preserve accrued position.
+        // With queue priority any modify is a new order at the back.
         let price_changed = refreshed.price() != order.price()
-            || refreshed.trigger_price() != order.trigger_price();
+            || refreshed.trigger_price() != order.trigger_price()
+            || (self.config.queue_priority_ms.is_some()
+                && refreshed.quantity() != order.quantity());
 
         if price_changed
             && refreshed.is_open()
@@ -12737,6 +12826,227 @@ mod tests {
             .filled_qty()
             .as_f64();
         assert_eq!(got, filled);
+    }
+
+    /// A step of `test_queue_priority_by_rate`, at a time in ms: a book order
+    /// (id, price, size) or a snapshot of orders at 100.00, a book order moved
+    /// to 100.00, an own order placed or resized at 100.00, or a trade there.
+    #[derive(Debug, Clone, Copy)]
+    enum PriorityStep {
+        Add(u64, &'static str, &'static str, u64),
+        Snapshot(&'static [(u64, &'static str)], u64),
+        Move(u64, &'static str, u64),
+        Place(&'static str, &'static str, u64),
+        Resize(&'static str, &'static str, u64),
+        Trade(&'static str, u64),
+    }
+
+    use PriorityStep::{Add, Move, Place, Resize, Snapshot, Trade};
+
+    // Own orders pay rate 3; book orders in `inserts` without a known rate 3.
+    const OLD_AND_YOUNG: [PriorityStep; 2] = [
+        Add(1, "100.00", "10.000", 0),
+        Add(2, "100.00", "7.000", 1_800),
+    ];
+
+    #[rstest]
+    // Ours at 2 s against order 2 (7 at 1.8 s), young: by its rate.
+    #[case::young_higher_rate_stays_ahead(3, &[(2, 5)], &[], &[Place("A", "5.000", 2_000), Trade("15.000", 2_100)], &[("A", 0.0)])]
+    #[case::young_equal_rate_stays_ahead(3, &[(2, 3)], &[], &[Place("A", "5.000", 2_000), Trade("15.000", 2_100)], &[("A", 0.0)])]
+    #[case::young_lower_rate_goes_behind(3, &[(2, 2)], &[], &[Place("A", "5.000", 2_000), Trade("15.000", 2_100)], &[("A", 5.0)])]
+    #[case::known_rate_overrides_the_fallback(3, &[(2, 0)], &[(2, 1)], &[Place("A", "5.000", 2_000), Trade("15.000", 2_100)], &[("A", 5.0)])]
+    #[case::insert_falls_back_to_inserted_rate(3, &[], &[(2, 1)], &[Place("A", "5.000", 2_000), Trade("15.000", 2_100)], &[("A", 0.0)])]
+    #[case::unknown_order_pays_none(3, &[], &[], &[Place("A", "5.000", 2_000), Trade("15.000", 2_100)], &[("A", 5.0)])]
+    #[case::no_priority_keeps_arrival_order(0, &[], &[], &[Place("A", "5.000", 2_000), Trade("15.000", 2_100)], &[("A", 0.0)])]
+    // Order 3 (4 at 2.05 s) arrives while ours is young.
+    #[case::higher_rate_arrival_goes_ahead(3, &[(3, 4)], &[], &[Place("A", "5.000", 2_000), Add(3, "100.00", "4.000", 2_050), Trade("15.000", 2_100)], &[("A", 1.0)])]
+    #[case::equal_rate_arrival_stays_behind(3, &[(3, 3)], &[], &[Place("A", "5.000", 2_000), Add(3, "100.00", "4.000", 2_050), Trade("15.000", 2_100)], &[("A", 5.0)])]
+    #[case::higher_rate_naming_one_behind_ours_goes_ahead(3, &[(3, 4)], &[(3, 2)], &[Place("A", "5.000", 2_000), Add(3, "100.00", "4.000", 2_050), Trade("15.000", 2_100)], &[("A", 1.0)])]
+    #[case::insert_ahead_of_one_ahead_goes_ahead(3, &[(3, 0)], &[(3, 1)], &[Place("A", "5.000", 2_000), Add(3, "100.00", "4.000", 2_050), Trade("15.000", 2_100)], &[("A", 1.0)])]
+    #[case::arrival_after_ours_is_locked_stays_behind(3, &[(3, 9)], &[], &[Place("A", "5.000", 2_000), Add(3, "100.00", "4.000", 2_450), Trade("15.000", 2_500)], &[("A", 5.0)])]
+    // A modify makes ours a new order at the back, at no rate: behind order
+    // 2, and behind an arrival at any rate while it is young.
+    #[case::resized_order_joins_the_back(3, &[(3, 0)], &[], &[Place("A", "5.000", 2_000), Resize("A", "6.000", 2_050), Add(3, "100.00", "4.000", 2_100), Trade("20.000", 2_200)], &[("A", 3.0)])]
+    #[case::resized_order_has_no_rate(3, &[(3, 1)], &[], &[Place("A", "5.000", 2_000), Resize("A", "6.000", 2_050), Add(3, "100.00", "4.000", 2_100), Trade("20.000", 2_200)], &[("A", 0.0)])]
+    // Order 4 (6 at 101.00, 1.8 s, rate 5) moves to 100.00 at 1.9 s: a new
+    // order there at no rate.
+    #[case::moved_order_is_new_at_no_rate(3, &[(2, 0), (4, 5)], &[], &[Add(4, "101.00", "6.000", 1_800), Move(4, "100.00", 1_900), Place("A", "5.000", 2_000), Trade("15.000", 2_100)], &[("A", 5.0)])]
+    // A snapshot's orders are of unknown age: old, unless seen young before
+    // (order 2, behind ours; order 5 ahead).
+    #[case::snapshot_orders_are_old(3, &[], &[], &[Snapshot(&[(1, "10.000"), (2, "7.000"), (5, "3.000")], 1_900), Place("A", "5.000", 2_000), Trade("15.000", 2_100)], &[("A", 2.0)])]
+    #[case::young_order_stays_young_in_a_snapshot(3, &[], &[], &[Snapshot(&[(1, "10.000"), (2, "7.000")], 1_900), Place("A", "5.000", 2_000), Trade("15.000", 2_100)], &[("A", 5.0)])]
+    // Two own orders level with the same orders ahead.
+    #[case::own_orders_keep_arrival_order(3, &[(2, 9)], &[], &[Place("A", "5.000", 2_000), Place("B", "5.000", 2_100), Trade("20.000", 2_200)], &[("A", 3.0), ("B", 0.0)])]
+    #[case::priority_order_goes_ahead_of_our_resized_one(3, &[(2, 9)], &[], &[Place("A", "5.000", 2_000), Resize("A", "6.000", 2_050), Place("B", "5.000", 2_100), Trade("20.000", 2_200)], &[("A", 0.0), ("B", 3.0)])]
+    fn test_queue_priority_by_rate(
+        #[case] own_rate: u64,
+        #[case] rates: &[(u64, u64)],
+        #[case] inserts: &[(u64, u64)],
+        #[case] steps: &[PriorityStep],
+        #[case] filled: &[(&str, f64)],
+    ) {
+        let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
+        let instrument_id = instrument.id();
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
+        let insert_before = crate::matching_engine::config::InsertBefore {
+            own_rate,
+            inserted_rate: 3,
+            ..Default::default()
+        };
+        insert_before
+            .rates
+            .borrow_mut()
+            .extend(rates.iter().copied());
+        insert_before
+            .orders
+            .borrow_mut()
+            .extend(inserts.iter().copied());
+        let (mut engine, cache) = get_queue_engine_clock(
+            instrument,
+            BookType::L3_MBO,
+            OrderMatchingEngineConfig {
+                trade_execution: true,
+                queue_position: true,
+                queue_priority_ms: Some(400),
+                insert_before: Some(insert_before),
+                ..Default::default()
+            },
+            Rc::clone(&clock),
+        );
+        let delta = |action, id: u64, price: &str, size: &str, flags: u8, ms: u64| {
+            let ts = UnixNanos::from(ms * 1_000_000);
+            OrderBookDelta::new(
+                instrument_id,
+                action,
+                BookOrder::new(
+                    OrderSide::Sell,
+                    Price::from(price),
+                    Quantity::from(size),
+                    id,
+                ),
+                flags,
+                id,
+                ts,
+                ts,
+            )
+        };
+        let mut own: ahash::AHashMap<&str, OrderAny> = ahash::AHashMap::new();
+        let mut last_ms = 0;
+        for step in OLD_AND_YOUNG.iter().chain(steps) {
+            let ms = match *step {
+                Add(.., ms)
+                | Snapshot(_, ms)
+                | Move(_, _, ms)
+                | Place(_, _, ms)
+                | Resize(_, _, ms)
+                | Trade(_, ms) => ms,
+            };
+            if ms > last_ms {
+                clock
+                    .borrow_mut()
+                    .advance_time(UnixNanos::from(ms * 1_000_000), true);
+                last_ms = ms;
+            }
+            match *step {
+                Add(id, price, size, ms) => engine
+                    .process_order_book_delta(&delta(BookAction::Add, id, price, size, 0, ms))
+                    .unwrap(),
+                Snapshot(orders, ms) => {
+                    let ts = UnixNanos::from(ms * 1_000_000);
+                    engine
+                        .process_order_book_delta(&OrderBookDelta::clear(instrument_id, 0, ts, ts))
+                        .unwrap();
+                    for (i, &(id, size)) in orders.iter().enumerate() {
+                        let mut flags = RecordFlag::F_SNAPSHOT as u8;
+                        if i + 1 == orders.len() {
+                            flags |= RecordFlag::F_LAST as u8;
+                        }
+                        engine
+                            .process_order_book_delta(&delta(
+                                BookAction::Add,
+                                id,
+                                "100.00",
+                                size,
+                                flags,
+                                ms,
+                            ))
+                            .unwrap();
+                    }
+                }
+                Move(id, price, ms) => {
+                    let size = engine
+                        .book
+                        .get_orders_at_level(Price::from("101.00"), OrderSide::Buy)
+                        .iter()
+                        .find(|o| o.order_id == id)
+                        .unwrap()
+                        .size
+                        .to_string();
+                    engine
+                        .process_order_book_delta(&delta(
+                            BookAction::Update,
+                            id,
+                            price,
+                            &size,
+                            0,
+                            ms,
+                        ))
+                        .unwrap();
+                }
+                Place(name, qty, _) => {
+                    let mut order = OrderTestBuilder::new(OrderType::Limit)
+                        .instrument_id(instrument_id)
+                        .side(OrderSide::Sell)
+                        .price(Price::from("100.00"))
+                        .quantity(Quantity::from(qty))
+                        .client_order_id(ClientOrderId::from(name))
+                        .submit(true)
+                        .build();
+                    process_cached_order(&mut engine, &mut order, AccountId::from("SIM-001"));
+                    own.insert(name, order);
+                }
+                Resize(name, qty, ms) => {
+                    let order = &own[name];
+                    let command = ModifyOrder::new(
+                        order.trader_id(),
+                        None,
+                        order.strategy_id(),
+                        instrument_id,
+                        order.client_order_id(),
+                        order.venue_order_id(),
+                        Some(Quantity::from(qty)),
+                        None,
+                        None,
+                        UUID4::new(),
+                        UnixNanos::from(ms * 1_000_000),
+                        None,
+                        None,
+                    );
+                    engine.process_modify(&command, AccountId::from("SIM-001"));
+                }
+                Trade(size, ms) => {
+                    let ts = UnixNanos::from(ms * 1_000_000);
+                    engine.process_trade_tick(&TradeTick::new(
+                        instrument_id,
+                        Price::from("100.00"),
+                        Quantity::from(size),
+                        AggressorSide::Buy,
+                        TradeId::new("T-1"),
+                        ts,
+                        ts,
+                    ));
+                }
+            }
+        }
+        for &(name, expected) in filled {
+            let got = cache
+                .borrow()
+                .order(&ClientOrderId::from(name))
+                .unwrap()
+                .filled_qty()
+                .as_f64();
+            assert_eq!(got, expected, "{name}");
+        }
     }
 
     #[rstest]

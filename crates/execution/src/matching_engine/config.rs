@@ -23,15 +23,18 @@ use serde::{Deserialize, Serialize};
 /// `queue_priority_ms` old, a higher rate goes ahead, and an equal one keeps
 /// arrival order.
 ///
-/// `orders` holds each L3 book order that the venue placed ahead of an
-/// earlier order at its price (its `insert_before`), by its id: the order it
-/// went ahead of. A book delta can't say so, so the replay that streams the
-/// deltas fills this beside them, and the matching engine drops an order's
-/// entry once it leaves the book. Those orders are taken to pay
-/// `inserted_rate`, others none; own orders pay `own_rate`.
+/// A book delta can't carry an order's rate or the order it went ahead of,
+/// so the replay that streams the deltas fills these tables beside them, by
+/// book order id, and the matching engine drops an order's entries once it
+/// leaves the book. `rates` holds each order's rate where it is known.
+/// `orders` holds each order that the venue placed ahead of an earlier order
+/// at its price (its `insert_before`): the order it went ahead of. An order
+/// without a known rate is taken to pay `inserted_rate` if it is in
+/// `orders`, else none. Own orders pay `own_rate`, but none once modified.
 #[derive(Clone, Default)]
 pub struct InsertBefore {
     pub orders: Rc<RefCell<AHashMap<OrderId, OrderId>>>,
+    pub rates: Rc<RefCell<AHashMap<OrderId, u64>>>,
     pub own_rate: u64,
     pub inserted_rate: u64,
 }
@@ -39,11 +42,19 @@ pub struct InsertBefore {
 impl InsertBefore {
     #[must_use]
     pub fn rate(&self, id: &OrderId) -> u64 {
-        if self.orders.borrow().contains_key(id) {
+        if let Some(&rate) = self.rates.borrow().get(id) {
+            rate
+        } else if self.orders.borrow().contains_key(id) {
             self.inserted_rate
         } else {
             0
         }
+    }
+
+    /// Forgets an order that left the book.
+    pub fn remove(&self, id: &OrderId) {
+        self.orders.borrow_mut().remove(id);
+        self.rates.borrow_mut().remove(id);
     }
 }
 
@@ -51,8 +62,9 @@ impl fmt::Debug for InsertBefore {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "InsertBefore({} orders, own rate {}, inserted rate {})",
+            "InsertBefore({} orders, {} rates, own rate {}, inserted rate {})",
             self.orders.borrow().len(),
+            self.rates.borrow().len(),
             self.own_rate,
             self.inserted_rate
         )
@@ -102,14 +114,14 @@ pub struct OrderMatchingEngineConfig {
     /// If set, a new resting order goes ahead of the orders at its price
     /// that arrived within this many milliseconds before it, as one paying a
     /// venue's queue priority fee does (Hyperliquid's: 400 ms), and stays
-    /// behind older ones. On an L3 book; on others it joins the front. A
-    /// modified order still joins the back.
+    /// behind older ones. On an L3 book; on others it joins the front. Any
+    /// modified order joins the back, since the venue makes it a new order.
     pub queue_priority_ms: Option<u64>,
-    /// With `queue_priority_ms` on an L3 book, the priority rates: a book
-    /// order that went ahead of an order ahead of an own order is ahead of it
-    /// too; one less than `queue_priority_ms` older than an own order stays
-    /// ahead of it at a rate at least the own one; and one arriving while an
-    /// own order is that young goes ahead of it at a higher rate.
+    /// With `queue_priority_ms` on an L3 book, the priority rates: an order
+    /// goes ahead of the orders at its price less than `queue_priority_ms`
+    /// old at a lower rate, and stays behind those at an equal or higher one;
+    /// a book order that went ahead of an order ahead of an own order is
+    /// ahead of it too.
     #[serde(skip)]
     pub insert_before: Option<InsertBefore>,
     #[builder(default)]
