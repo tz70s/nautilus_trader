@@ -648,7 +648,18 @@ impl HyperliquidWebSocketClient {
         signer: &HyperliquidHttpClient,
         action: &HyperliquidExchangeAction,
     ) -> Result<HyperliquidExchangeResponse, PostRequestError> {
-        self.post_action_result(signer, action, self.post_timeout, None)
+        self.post_action_command_expiring(signer, action, None)
+            .await
+    }
+
+    /// As `post_action_command`, signing `expiresAfter` (ms) into the action when set.
+    pub(crate) async fn post_action_command_expiring(
+        &self,
+        signer: &HyperliquidHttpClient,
+        action: &HyperliquidExchangeAction,
+        expires_after: Option<u64>,
+    ) -> Result<HyperliquidExchangeResponse, PostRequestError> {
+        self.post_action_result(signer, action, self.post_timeout, expires_after)
             .await
     }
 
@@ -2463,6 +2474,17 @@ fn cancel_errors_for_requests(
     Ok(errors)
 }
 
+/// Top-level error the venue returns (`{"status":"err"}`) for an action whose
+/// `expiresAfter` is earlier than the executing block's timestamp. The action
+/// never reaches the book, so it surfaces as a venue rejection.
+pub const EXPIRED_ACTION_ERROR: &str = "Action already expired";
+
+/// Returns whether a rejection reason reports an action that expired before execution.
+#[must_use]
+pub fn is_expired_action_error(reason: &str) -> bool {
+    reason.contains(EXPIRED_ACTION_ERROR)
+}
+
 fn map_post_payload_error(payload: String, weight: u32) -> HyperliquidError {
     let lower = payload.to_ascii_lowercase();
     let message = format!("WebSocket post error: {payload}");
@@ -3530,6 +3552,15 @@ mod tests {
         let err = map_post_payload_error(payload.to_string(), 1);
 
         assert!(matches!(err, HyperliquidError::Exchange(_)));
+    }
+
+    #[rstest]
+    #[case("Action already expired", true)]
+    #[case("API error: Action already expired", true)]
+    #[case("Order has invalid price.", false)]
+    #[case("Too many requests", false)]
+    fn test_is_expired_action_error(#[case] message: &str, #[case] expected: bool) {
+        assert_eq!(is_expired_action_error(message), expected);
     }
 
     #[rstest]

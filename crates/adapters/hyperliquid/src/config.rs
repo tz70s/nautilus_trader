@@ -246,6 +246,13 @@ pub struct HyperliquidExecutionClientConfig {
     /// can emit closing fills for markets that are still trading.
     #[builder(default = 0)]
     pub outcome_settlement_poll_secs: u64,
+    /// Milliseconds after signing at which the venue rejects a new-order action
+    /// (`expiresAfter`), so a late order never reaches the book. `None` or 0 sends
+    /// no expiry. The venue charges an expired action 5x the usual rate-limit weight.
+    pub order_expires_after_ms: Option<u64>,
+    /// As `order_expires_after_ms`, for modify actions. An expired modify leaves
+    /// the order resting at its previous price.
+    pub modify_expires_after_ms: Option<u64>,
 }
 
 #[cfg(feature = "python")]
@@ -394,6 +401,17 @@ book_snapshot_timeout_secs = 4
             config.outcome_settlement_poll_secs,
             expected.outcome_settlement_poll_secs,
         );
+        assert_eq!(config.order_expires_after_ms, None);
+        assert_eq!(config.modify_expires_after_ms, None);
+    }
+
+    #[rstest]
+    fn test_exec_config_toml_expires_after() {
+        let config: HyperliquidExecutionClientConfig =
+            toml::from_str("order_expires_after_ms = 350\nmodify_expires_after_ms = 500").unwrap();
+
+        assert_eq!(config.order_expires_after_ms, Some(350));
+        assert_eq!(config.modify_expires_after_ms, Some(500));
     }
 
     #[rstest]

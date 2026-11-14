@@ -1003,6 +1003,7 @@ impl ExecutionClient for HyperliquidExecutionClient {
         let nested_spawner = task_spawner.clone();
         let builder = self.http_client.builder_attribution();
         let denied_order = order.clone();
+        let expires_after_ms = self.config.order_expires_after_ms;
 
         if let Err(e) = task_spawner.spawn(async move {
             http_client.cache_client_order_id_cloid(order.client_order_id(), cloid);
@@ -1023,8 +1024,9 @@ impl ExecutionClient for HyperliquidExecutionClient {
                 nested_spawner,
             );
 
+            let expires_after = action_expires_after(clock, expires_after_ms);
             match ws_client
-                .post_action_command(&http_client, &action)
+                .post_action_command_expiring(&http_client, &action, expires_after)
                 .await
                 .map_err(classify_post_failure)
             {
@@ -1179,6 +1181,7 @@ impl ExecutionClient for HyperliquidExecutionClient {
         let staged_brackets = self.staged_brackets.clone();
         let builder = self.http_client.builder_attribution();
         let nested_spawner = task_spawner.clone();
+        let expires_after_ms = self.config.order_expires_after_ms;
 
         if let Err(e) = task_spawner.spawn(async move {
             if let Some((parent_id, children)) = staged_children {
@@ -1205,6 +1208,7 @@ impl ExecutionClient for HyperliquidExecutionClient {
                 dispatch_state,
                 staged_brackets,
                 clock,
+                expires_after_ms,
                 nested_spawner,
             )
             .await;
@@ -1467,6 +1471,7 @@ impl ExecutionClient for HyperliquidExecutionClient {
         let emitter = self.emitter.clone();
         let clock = self.clock;
         let command = cmd.clone();
+        let expires_after_ms = self.config.modify_expires_after_ms;
 
         if !self.spawn_task("modify_order", async move {
             let action = HyperliquidExchangeAction::Modify {
@@ -1476,8 +1481,9 @@ impl ExecutionClient for HyperliquidExecutionClient {
                 },
             };
 
+            let expires_after = action_expires_after(clock, expires_after_ms);
             let failure = match ws_client
-                .post_action_command(&http_client, &action)
+                .post_action_command_expiring(&http_client, &action, expires_after)
                 .await
                 .map_err(classify_post_failure)
             {
@@ -3610,6 +3616,14 @@ impl CancelDispatch {
     }
 }
 
+/// Returns the `expiresAfter` timestamp (ms) for an action signed now, or `None`
+/// when expiry is disabled.
+fn action_expires_after(clock: &AtomicTime, expires_after_ms: Option<u64>) -> Option<u64> {
+    expires_after_ms
+        .filter(|ms| *ms > 0)
+        .map(|ms| clock.get_time_ms() + ms)
+}
+
 fn classify_post_failure(failure: PostRequestError) -> CommandFailure {
     let (error, outcome) = match failure {
         PostRequestError::BeforeDispatch(error) => {
@@ -3990,6 +4004,7 @@ async fn post_order_batch(
     dispatch_state: Arc<WsDispatchState>,
     staged_brackets: Arc<Mutex<StagedBracketState>>,
     clock: &'static AtomicTime,
+    expires_after_ms: Option<u64>,
     task_spawner: TaskSpawner,
 ) {
     let cloid_hexes: Vec<Ustr> = requests
@@ -4017,8 +4032,9 @@ async fn post_order_batch(
         task_spawner,
     );
 
+    let expires_after = action_expires_after(clock, expires_after_ms);
     match ws_client
-        .post_action_command(http_client, &action)
+        .post_action_command_expiring(http_client, &action, expires_after)
         .await
         .map_err(classify_post_failure)
     {
@@ -4123,6 +4139,7 @@ fn spawn_staged_children(
             dispatch_state,
             staged_brackets,
             clock,
+            None,
             child_spawner,
         )
         .await;
@@ -7540,6 +7557,28 @@ mod tests {
             .map_err(classify_post_failure)
             .unwrap_err();
         assert_eq!(failure, CommandFailure::not_sent("timeout"));
+    }
+
+    #[rstest]
+    fn test_expired_action_classifies_as_venue_rejection() {
+        let reason = crate::websocket::client::EXPIRED_ACTION_ERROR.to_string();
+        let failure = classify_post_failure(crate::websocket::client::PostRequestError::Rejected {
+            error: crate::http::error::Error::bad_request(format!("API error: {reason}")),
+            reason: reason.clone(),
+        });
+
+        assert_eq!(failure, CommandFailure::venue_rejected(reason));
+    }
+
+    #[rstest]
+    #[case(None, None)]
+    #[case(Some(0), None)]
+    #[case(Some(350), Some(1_700_000_000_350))]
+    fn test_action_expires_after(#[case] after_ms: Option<u64>, #[case] expected: Option<u64>) {
+        let clock =
+            nautilus_core::time::AtomicTime::new(false, UnixNanos::from(1_700_000_000_000_000_000));
+
+        assert_eq!(super::action_expires_after(&clock, after_ms), expected);
     }
 
     #[rstest]

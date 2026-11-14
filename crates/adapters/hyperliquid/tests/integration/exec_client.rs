@@ -70,6 +70,7 @@ use nautilus_hyperliquid::{
     config::HyperliquidExecutionClientConfig,
     execution::HyperliquidExecutionClient,
     http::models::{Cloid, HyperliquidFill},
+    websocket::client::EXPIRED_ACTION_ERROR,
 };
 use nautilus_live::{
     ExecutionClientCore, SocketReconnectRegistry, SocketReconnectRequestOutcome,
@@ -110,6 +111,7 @@ struct TestServerState {
     exchange_request_count: Arc<tokio::sync::Mutex<usize>>,
     info_requests: Arc<tokio::sync::Mutex<Vec<Value>>>,
     last_exchange_action: Arc<tokio::sync::Mutex<Option<Value>>>,
+    last_exchange_expires_after: Arc<tokio::sync::Mutex<Option<u64>>>,
     reject_next_order: Arc<std::sync::atomic::AtomicBool>,
     /// Returns a `status="ok"` envelope whose inner `statuses[0]` carries a
     /// per-order `error` object on the next exchange call. This exercises
@@ -181,6 +183,7 @@ impl Default for TestServerState {
             exchange_request_count: Arc::new(tokio::sync::Mutex::new(0)),
             info_requests: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             last_exchange_action: Arc::new(tokio::sync::Mutex::new(None)),
+            last_exchange_expires_after: Arc::new(tokio::sync::Mutex::new(None)),
             reject_next_order: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             inner_order_error_next: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             cancel_response_override: Arc::new(tokio::sync::Mutex::new(None)),
@@ -760,6 +763,11 @@ async fn handle_ws_post(socket: &mut WebSocket, state: &TestServerState, payload
     }
 
     *state.last_exchange_action.lock().await = Some(action.clone());
+    *state.last_exchange_expires_after.lock().await = payload
+        .get("request")
+        .and_then(|v| v.get("payload"))
+        .and_then(|v| v.get("expiresAfter"))
+        .and_then(Value::as_u64);
 
     if state.fail_next_exchange.swap(false, Ordering::Relaxed) {
         return send_ws_post_error_response(socket, id, "503 Service Unavailable").await;
@@ -4404,6 +4412,91 @@ async fn test_submit_order_ws_post_includes_builder_attribution() {
             .and_then(|v| v.get("f"))
             .and_then(|v| v.as_u64()),
         Some(0),
+    );
+
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_order_expires_after_signs_placements_but_not_cancels() {
+    let state = TestServerState::default();
+    let exchange_count = state.exchange_request_count.clone();
+    let last_action = state.last_exchange_action.clone();
+    let last_expires_after = state.last_exchange_expires_after.clone();
+    let response_override = state.command_response_override.clone();
+    let addr = start_mock_server(state).await;
+    let mut config = create_test_exec_config(addr);
+    config.order_expires_after_ms = Some(350);
+
+    let (mut client, mut rx, cache) = create_test_execution_client_from_config(config);
+    add_test_account_to_cache(&cache, AccountId::from("HYPERLIQUID-001"));
+    client.start().unwrap();
+    client.connect().await.unwrap();
+
+    let submit = |id: &str| {
+        let order = make_limit_order(id);
+        cache
+            .borrow_mut()
+            .add_order(order.clone(), None, None, false)
+            .unwrap();
+        let cmd = SubmitOrder::from_order(
+            &order,
+            order.trader_id(),
+            Some(*HYPERLIQUID_CLIENT_ID),
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+        );
+        client.submit_order(cmd).unwrap();
+        order
+    };
+    let wait_for = |n: usize| {
+        let exchange_count = exchange_count.clone();
+        wait_until_async(
+            move || {
+                let exchange_count = exchange_count.clone();
+                async move { *exchange_count.lock().await >= n }
+            },
+            Duration::from_secs(5),
+        )
+    };
+
+    let before = get_atomic_clock_realtime().get_time_ms();
+    let order = submit("O-EXPIRES-1");
+    wait_for(1).await;
+    let after = get_atomic_clock_realtime().get_time_ms();
+    let expires_after = last_expires_after
+        .lock()
+        .await
+        .expect("missing expiresAfter");
+    assert!((before + 350..=after + 350).contains(&expires_after));
+
+    client
+        .cancel_order(make_cancel_entry(
+            order.client_order_id(),
+            VenueOrderId::from("12345"),
+        ))
+        .unwrap();
+    wait_for(2).await;
+    let action = last_action.lock().await.clone().unwrap();
+    assert_ne!(action["type"], "order");
+    assert_eq!(*last_expires_after.lock().await, None);
+
+    *response_override.lock().await = Some(json!({
+        "status": "err",
+        "response": EXPIRED_ACTION_ERROR,
+    }));
+    let expired = submit("O-EXPIRES-2");
+    wait_until_async(
+        || async { client.pending_tasks_all_finished() },
+        Duration::from_secs(5),
+    )
+    .await;
+    let rejected = drain_rejected_events(&mut rx, Duration::from_millis(500)).await;
+    assert!(
+        rejected.contains(&(expired.client_order_id(), EXPIRED_ACTION_ERROR.to_string())),
+        "{rejected:?}",
     );
 
     client.disconnect().await.unwrap();

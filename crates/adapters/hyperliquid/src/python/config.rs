@@ -185,6 +185,8 @@ impl HyperliquidExecutionClientConfig {
             ws_post_timeout_secs: ws_post_timeout_secs.unwrap_or(defaults.ws_post_timeout_secs),
             transport_backend: transport_backend.unwrap_or(defaults.transport_backend),
             outcome_settlement_poll_secs: defaults.outcome_settlement_poll_secs,
+            order_expires_after_ms: defaults.order_expires_after_ms,
+            modify_expires_after_ms: defaults.modify_expires_after_ms,
         }
     }
 

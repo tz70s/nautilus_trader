@@ -4073,15 +4073,18 @@ mod tests {
     use crate::{
         common::{
             consts::{ASSET_INDEX_INFO_KEY, HYPERLIQUID_VENUE, NAUTILUS_BUILDER_ADDRESS},
+            credential::EvmPrivateKey,
             enums::{HyperliquidEnvironment, HyperliquidProductType},
         },
         http::{
             models::{
-                Cloid, HyperliquidExchangeResponse, HyperliquidOrderStatusEntry, PerpAsset,
-                PerpDex, PerpMeta,
+                Cloid, HyperliquidExchangeAction, HyperliquidExchangeCancelOrderRequest,
+                HyperliquidExchangeResponse, HyperliquidOrderStatusEntry, PerpAsset, PerpDex,
+                PerpMeta,
             },
             query::InfoRequest,
         },
+        signing::{HyperliquidActionType, HyperliquidEip712Signer, SignRequest, TimeNonce},
     };
 
     const TEST_PRIVATE_KEY: &str =
@@ -4517,6 +4520,58 @@ mod tests {
         .unwrap();
 
         assert_eq!(client.get_account_address().unwrap(), account_address);
+    }
+
+    #[rstest]
+    fn test_sign_action_exec_request_signs_and_sends_expires_after() {
+        let client = HyperliquidHttpClient::with_credentials(
+            Some(TEST_PRIVATE_KEY.to_string()),
+            None,
+            None,
+            HyperliquidEnvironment::Testnet,
+            60,
+            None,
+        )
+        .unwrap();
+        let action = HyperliquidExchangeAction::Cancel {
+            cancels: vec![HyperliquidExchangeCancelOrderRequest { asset: 0, oid: 1 }],
+            fast: None,
+        };
+        let expires_after = 1_700_000_000_350;
+
+        let request = client
+            .sign_action_exec_request(&action, Some(expires_after))
+            .unwrap();
+
+        let body = serde_json::to_value(&request).unwrap();
+        assert_eq!(body["expiresAfter"], json!(expires_after));
+
+        let signer =
+            HyperliquidEip712Signer::new(&EvmPrivateKey::new(TEST_PRIVATE_KEY).unwrap()).unwrap();
+        let sign = |expires_after| {
+            let bundle = signer
+                .sign(&SignRequest {
+                    action: None,
+                    action_bytes: Some(rmp_serde::to_vec_named(&action).unwrap()),
+                    time_nonce: TimeNonce::from_millis(i128::from(request.nonce)),
+                    action_type: HyperliquidActionType::L1,
+                    is_testnet: true,
+                    vault_address: None,
+                    expires_after,
+                })
+                .unwrap();
+            serde_json::to_value(bundle.signature).unwrap()
+        };
+        assert_eq!(body["signature"], sign(Some(expires_after)));
+        assert_ne!(body["signature"], sign(None));
+
+        let unexpiring = client.sign_action_exec_request(&action, None).unwrap();
+        assert!(
+            serde_json::to_value(&unexpiring)
+                .unwrap()
+                .get("expiresAfter")
+                .is_none()
+        );
     }
 
     #[rstest]
