@@ -97,11 +97,15 @@ impl MessageHeader {
     /// instrument loading on a server-side bump. A different schema ID is a breaking
     /// change and is still rejected.
     ///
-    /// The decoders assume block layouts are stable within a schema ID.
-    /// `decode_exchange_info` verifies the symbol block length and fails loudly on a
-    /// mismatch; the market-data decoders read groups at a fixed offset, so a future
-    /// version that adds fixed-block fields to those messages would need them updated
-    /// to advance past the added bytes via `block_length`.
+    /// The symbols, klines, balances, account trades and fills groups accept a block at
+    /// least as long as the fields they read, skip any appended fields via the group's
+    /// `block_length` (schema 3:6 grew the symbol block from 19 to 22 bytes), and reject
+    /// a shorter one. Groups read via `SbeCursor::read_group` also skip by
+    /// `block_length` but don't reject a short block. The nested exchangeInfo groups
+    /// (filters, permission sets, permissions) ignore their `block_length`, which is 0
+    /// in 3:6. Root blocks of the market-data and account responses are read at fixed
+    /// offsets, so a version that appends fields to those roots would need them updated
+    /// to skip via the header's `block_length`.
     fn validate(&self) -> Result<(), SbeDecodeError> {
         if self.schema_id != SBE_SCHEMA_ID {
             return Err(SbeDecodeError::SchemaMismatch {
@@ -297,7 +301,7 @@ pub fn decode_klines(buf: &[u8]) -> Result<BinanceKlines, SbeDecodeError> {
 
     let (block_len, count) = cursor.read_group_header()?;
 
-    if block_len != KLINES_BLOCK_LENGTH {
+    if block_len < KLINES_BLOCK_LENGTH {
         return Err(SbeDecodeError::InvalidBlockLength {
             expected: KLINES_BLOCK_LENGTH,
             actual: block_len,
@@ -307,7 +311,7 @@ pub fn decode_klines(buf: &[u8]) -> Result<BinanceKlines, SbeDecodeError> {
     let mut klines = Vec::with_capacity(count as usize);
 
     for _ in 0..count {
-        cursor.require(KLINES_BLOCK_LENGTH as usize)?;
+        cursor.require(block_len as usize)?;
 
         let open_time = cursor.read_i64_le()?;
         let open_price = cursor.read_i64_le()?;
@@ -334,6 +338,7 @@ pub fn decode_klines(buf: &[u8]) -> Result<BinanceKlines, SbeDecodeError> {
         let taker_buy_quote_volume_slice = cursor.read_bytes(16)?;
         let mut taker_buy_quote_volume = [0u8; 16];
         taker_buy_quote_volume.copy_from_slice(taker_buy_quote_volume_slice);
+        cursor.advance(usize::from(block_len - KLINES_BLOCK_LENGTH))?;
 
         klines.push(BinanceKline {
             open_time,
@@ -968,7 +973,7 @@ pub fn decode_account(buf: &[u8]) -> Result<BinanceAccountInfo, SbeDecodeError> 
 
     let (block_length, balance_count) = cursor.read_group_header()?;
 
-    if block_length != BALANCE_BLOCK_LENGTH {
+    if block_length < BALANCE_BLOCK_LENGTH {
         return Err(SbeDecodeError::InvalidBlockLength {
             expected: BALANCE_BLOCK_LENGTH,
             actual: block_length,
@@ -983,6 +988,7 @@ pub fn decode_account(buf: &[u8]) -> Result<BinanceAccountInfo, SbeDecodeError> 
         let exponent = cursor.read_i8()?;
         let free_mantissa = cursor.read_i64_le()?;
         let locked_mantissa = cursor.read_i64_le()?;
+        cursor.advance(usize::from(block_length - BALANCE_BLOCK_LENGTH))?;
 
         let asset = cursor.read_var_string8()?;
 
@@ -1031,7 +1037,7 @@ pub fn decode_account_trades(buf: &[u8]) -> Result<Vec<BinanceAccountTrade>, Sbe
 
     let (block_length, trade_count) = cursor.read_group_header()?;
 
-    if block_length != ACCOUNT_TRADE_BLOCK_LENGTH {
+    if block_length < ACCOUNT_TRADE_BLOCK_LENGTH {
         return Err(SbeDecodeError::InvalidBlockLength {
             expected: ACCOUNT_TRADE_BLOCK_LENGTH,
             actual: block_length,
@@ -1057,6 +1063,7 @@ pub fn decode_account_trades(buf: &[u8]) -> Result<Vec<BinanceAccountTrade>, Sbe
         let is_buyer = BoolEnum::from(cursor.read_u8()?) == BoolEnum::True;
         let is_maker = BoolEnum::from(cursor.read_u8()?) == BoolEnum::True;
         let is_best_match = BoolEnum::from(cursor.read_u8()?) == BoolEnum::True;
+        cursor.advance(usize::from(block_length - ACCOUNT_TRADE_BLOCK_LENGTH))?;
 
         let symbol = cursor.read_var_string8()?;
         let commission_asset = cursor.read_var_string8()?;
@@ -1093,7 +1100,7 @@ fn decode_fills_cursor(
 ) -> Result<Vec<BinanceOrderFill>, SbeDecodeError> {
     let (block_length, count) = cursor.read_group_header()?;
 
-    if block_length != FILLS_BLOCK_LENGTH {
+    if block_length < FILLS_BLOCK_LENGTH {
         return Err(SbeDecodeError::InvalidBlockLength {
             expected: FILLS_BLOCK_LENGTH,
             actual: block_length,
@@ -1112,6 +1119,7 @@ fn decode_fills_cursor(
         let commission_mantissa = cursor.read_i64_le()?;
         let trade_id = cursor.read_optional_i64_le()?;
         cursor.advance(8)?; // Skip allocId
+        cursor.advance(usize::from(block_length - FILLS_BLOCK_LENGTH))?;
 
         let commission_asset = cursor.read_var_string8()?;
 
@@ -1167,7 +1175,7 @@ pub fn decode_exchange_info(buf: &[u8]) -> Result<BinanceExchangeInfoSbe, SbeDec
     // Decode symbols group
     let (symbols_block_len, symbols_count) = cursor.read_group_header()?;
 
-    if symbols_block_len != SYMBOL_BLOCK_LENGTH as u16 {
+    if symbols_block_len < SYMBOL_BLOCK_LENGTH as u16 {
         return Err(SbeDecodeError::InvalidBlockLength {
             expected: SYMBOL_BLOCK_LENGTH as u16,
             actual: symbols_block_len,
@@ -1177,9 +1185,9 @@ pub fn decode_exchange_info(buf: &[u8]) -> Result<BinanceExchangeInfoSbe, SbeDec
     let mut symbols = Vec::with_capacity(symbols_count as usize);
 
     for _ in 0..symbols_count {
-        cursor.require(SYMBOL_BLOCK_LENGTH)?;
+        cursor.require(symbols_block_len as usize)?;
 
-        // Fixed fields (19 bytes)
+        // Fixed fields (19 bytes); schema 3:6 appends 3 more, skipped below
         let status = cursor.read_u8()?;
         let base_asset_precision = cursor.read_u8()?;
         let quote_asset_precision = cursor.read_u8()?;
@@ -1198,6 +1206,7 @@ pub fn decode_exchange_info(buf: &[u8]) -> Result<BinanceExchangeInfoSbe, SbeDec
         let _default_self_trade_prevention_mode = cursor.read_u8()?;
         let _allowed_self_trade_prevention_modes = cursor.read_u8()?;
         let _peg_instructions_allowed = cursor.read_u8()?;
+        cursor.advance(symbols_block_len as usize - SYMBOL_BLOCK_LENGTH)?;
 
         let (_filters_block_len, filters_count) = cursor.read_group_header()?;
         let mut filters = BinanceSymbolFiltersSbe::default();
@@ -2093,7 +2102,9 @@ mod tests {
     }
 
     #[rstest]
-    fn test_decode_account_with_balances() {
+    #[case::current(BALANCE_BLOCK_LENGTH)]
+    #[case::extended(BALANCE_BLOCK_LENGTH + 3)]
+    fn test_decode_account_with_balances(#[case] balance_block_length: u16) {
         let header = create_header(
             ACCOUNT_BLOCK_LENGTH as u16,
             ACCOUNT_TEMPLATE_ID,
@@ -2125,18 +2136,21 @@ mod tests {
         }
 
         // Balances group: 2 balances
-        buf.extend_from_slice(&create_group_header(BALANCE_BLOCK_LENGTH, 2));
+        buf.extend_from_slice(&create_group_header(balance_block_length, 2));
+        let extension = usize::from(balance_block_length - BALANCE_BLOCK_LENGTH);
 
         // Balance 1: BTC
         buf.push((-8i8) as u8); // exponent
         buf.extend_from_slice(&100_000_000i64.to_le_bytes()); // free (1.0 BTC)
         buf.extend_from_slice(&50_000_000i64.to_le_bytes()); // locked (0.5 BTC)
+        buf.resize(buf.len() + extension, 0xFF);
         write_var_string(&mut buf, "BTC");
 
         // Balance 2: USDT
         buf.push((-8i8) as u8); // exponent
         buf.extend_from_slice(&1_000_000_000_000i64.to_le_bytes()); // free (10000 USDT)
         buf.extend_from_slice(&0i64.to_le_bytes()); // locked
+        buf.resize(buf.len() + extension, 0xFF);
         write_var_string(&mut buf, "USDT");
 
         let account = decode_account(&buf).unwrap();
@@ -2176,7 +2190,9 @@ mod tests {
     }
 
     #[rstest]
-    fn test_decode_account_trades_multiple() {
+    #[case::current(ACCOUNT_TRADE_BLOCK_LENGTH)]
+    #[case::extended(ACCOUNT_TRADE_BLOCK_LENGTH + 8)]
+    fn test_decode_account_trades_multiple(#[case] block_length: u16) {
         let header = create_header(
             0,
             ACCOUNT_TRADES_TEMPLATE_ID,
@@ -2188,7 +2204,8 @@ mod tests {
         buf.extend_from_slice(&header);
 
         // Group header: 2 trades
-        buf.extend_from_slice(&create_group_header(ACCOUNT_TRADE_BLOCK_LENGTH, 2));
+        buf.extend_from_slice(&create_group_header(block_length, 2));
+        let extension = usize::from(block_length - ACCOUNT_TRADE_BLOCK_LENGTH);
 
         // Trade 1
         buf.push((-8i8) as u8); // price_exponent
@@ -2205,6 +2222,7 @@ mod tests {
         buf.push(1); // is_buyer
         buf.push(0); // is_maker
         buf.push(1); // is_best_match
+        buf.resize(buf.len() + extension, 0xFF);
         write_var_string(&mut buf, "BTCUSDT");
         write_var_string(&mut buf, "BNB");
 
@@ -2223,6 +2241,7 @@ mod tests {
         buf.push(0); // is_buyer (false = seller)
         buf.push(1); // is_maker
         buf.push(1); // is_best_match
+        buf.resize(buf.len() + extension, 0xFF);
         write_var_string(&mut buf, "ETHUSDT");
         write_var_string(&mut buf, "USDT");
 
@@ -2245,6 +2264,91 @@ mod tests {
     }
 
     #[rstest]
+    #[case::current(FILLS_BLOCK_LENGTH)]
+    #[case::extended(FILLS_BLOCK_LENGTH + 8)]
+    fn test_decode_fills(#[case] block_length: u16) {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&create_group_header(block_length, 1));
+        buf.push((-8i8) as u8); // commission_exponent
+        buf.push(1); // match_type
+        buf.extend_from_slice(&12_345i64.to_le_bytes()); // price
+        buf.extend_from_slice(&10_000i64.to_le_bytes()); // qty
+        buf.extend_from_slice(&100i64.to_le_bytes()); // commission
+        buf.extend_from_slice(&555i64.to_le_bytes()); // trade_id
+        buf.extend_from_slice(&i64::MIN.to_le_bytes()); // alloc_id
+        buf.resize(
+            buf.len() + usize::from(block_length - FILLS_BLOCK_LENGTH),
+            0xFF,
+        );
+        write_var_string(&mut buf, "USDT");
+
+        let fills = decode_fills_cursor(&mut SbeCursor::new(&buf)).unwrap();
+
+        assert_eq!(fills.len(), 1);
+        assert_eq!(fills[0].price_mantissa, 12_345);
+        assert_eq!(fills[0].trade_id, Some(555));
+        assert_eq!(fills[0].commission_asset, "USDT");
+    }
+
+    #[rstest]
+    fn test_decode_fills_rejects_short_block() {
+        let buf = create_group_header(FILLS_BLOCK_LENGTH - 1, 1);
+
+        assert!(matches!(
+            decode_fills_cursor(&mut SbeCursor::new(&buf)),
+            Err(SbeDecodeError::InvalidBlockLength {
+                expected: FILLS_BLOCK_LENGTH,
+                actual: 41
+            })
+        ));
+    }
+
+    #[rstest]
+    fn test_decode_account_rejects_short_balance_block() {
+        let header = create_header(
+            ACCOUNT_BLOCK_LENGTH as u16,
+            ACCOUNT_TEMPLATE_ID,
+            SBE_SCHEMA_ID,
+            SBE_SCHEMA_VERSION,
+        );
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&header);
+        buf.extend_from_slice(&[0u8; ACCOUNT_BLOCK_LENGTH]);
+        buf.extend_from_slice(&create_group_header(BALANCE_BLOCK_LENGTH - 1, 0));
+
+        assert!(matches!(
+            decode_account(&buf),
+            Err(SbeDecodeError::InvalidBlockLength {
+                expected: BALANCE_BLOCK_LENGTH,
+                actual: 16
+            })
+        ));
+    }
+
+    #[rstest]
+    fn test_decode_account_trades_rejects_short_block() {
+        let header = create_header(
+            0,
+            ACCOUNT_TRADES_TEMPLATE_ID,
+            SBE_SCHEMA_ID,
+            SBE_SCHEMA_VERSION,
+        );
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&header);
+        buf.extend_from_slice(&create_group_header(ACCOUNT_TRADE_BLOCK_LENGTH - 1, 0));
+
+        assert!(matches!(
+            decode_account_trades(&buf),
+            Err(SbeDecodeError::InvalidBlockLength {
+                expected: ACCOUNT_TRADE_BLOCK_LENGTH,
+                actual: 69
+            })
+        ));
+    }
+
+    #[rstest]
     fn test_decode_account_trades_empty() {
         let header = create_header(
             0,
@@ -2262,7 +2366,9 @@ mod tests {
     }
 
     #[rstest]
-    fn test_decode_exchange_info_single_symbol() {
+    #[case::schema_3_5(19)]
+    #[case::schema_3_6(22)]
+    fn test_decode_exchange_info_single_symbol(#[case] block_length: u16) {
         let header = create_header(
             0,
             EXCHANGE_INFO_TEMPLATE_ID,
@@ -2279,8 +2385,7 @@ mod tests {
         // Empty exchange_filters group
         buf.extend_from_slice(&create_group_header(0, 0));
 
-        // Symbols group: 1 symbol with block_length=19
-        buf.extend_from_slice(&create_group_header(SYMBOL_BLOCK_LENGTH as u16, 1));
+        buf.extend_from_slice(&create_group_header(block_length, 1));
 
         // Fixed block (19 bytes)
         buf.push(0); // status (Trading)
@@ -2301,6 +2406,10 @@ mod tests {
         buf.push(0); // default_self_trade_prevention_mode
         buf.push(0); // allowed_self_trade_prevention_modes
         buf.push(0); // peg_instructions_allowed
+        buf.resize(
+            buf.len() + usize::from(block_length) - SYMBOL_BLOCK_LENGTH,
+            1,
+        );
 
         // Filters nested group: 0 filters (SBE binary filters are skipped)
         buf.extend_from_slice(&create_group_header(0, 0));
@@ -2339,6 +2448,53 @@ mod tests {
         assert!(symbol.filters.lot_size_filter.is_none());
         assert_eq!(symbol.permissions.len(), 1);
         assert_eq!(symbol.permissions[0], vec!["SPOT"]);
+    }
+
+    #[rstest]
+    fn test_decode_exchange_info_rejects_short_symbol_block() {
+        let header = create_header(
+            0,
+            EXCHANGE_INFO_TEMPLATE_ID,
+            SBE_SCHEMA_ID,
+            SBE_SCHEMA_VERSION,
+        );
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&header);
+        buf.extend_from_slice(&create_group_header(11, 0));
+        buf.extend_from_slice(&create_group_header(0, 0));
+        buf.extend_from_slice(&create_group_header(SYMBOL_BLOCK_LENGTH as u16 - 1, 0));
+
+        assert!(matches!(
+            decode_exchange_info(&buf),
+            Err(SbeDecodeError::InvalidBlockLength {
+                expected: 19,
+                actual: 18
+            })
+        ));
+    }
+
+    #[rstest]
+    fn test_decode_exchange_info_schema_3_6_wire() {
+        let wire = include_bytes!("../../../test_data/spot/http_sbe/exchange_info_btcusdt_v6.sbe");
+
+        let info = decode_exchange_info(wire).unwrap();
+
+        assert_eq!(info.symbols.len(), 1);
+        let symbol = &info.symbols[0];
+        assert_eq!(symbol.symbol, "BTCUSDT");
+        assert_eq!(symbol.base_asset, "BTC");
+        assert_eq!(symbol.quote_asset, "USDT");
+        assert_eq!(symbol.base_asset_precision, 8);
+        assert_eq!(symbol.quote_asset_precision, 8);
+        assert!(symbol.is_spot_trading_allowed);
+        assert_eq!(symbol.permissions[0][0], "SPOT");
+        let price_filter = symbol.filters.price_filter.as_ref().unwrap();
+        assert_eq!(price_filter.price_exponent, -8);
+        assert_eq!(price_filter.tick_size, 1_000_000);
+        let lot_size_filter = symbol.filters.lot_size_filter.as_ref().unwrap();
+        assert_eq!(lot_size_filter.qty_exponent, -8);
+        assert_eq!(lot_size_filter.step_size, 1_000);
     }
 
     #[rstest]
@@ -2505,35 +2661,68 @@ mod tests {
     }
 
     #[rstest]
-    fn test_decode_klines_valid() {
+    #[case::current(KLINES_BLOCK_LENGTH)]
+    #[case::extended(KLINES_BLOCK_LENGTH + 8)]
+    fn test_decode_klines_valid(#[case] block_length: u16) {
         let header = create_header(2, KLINES_TEMPLATE_ID, SBE_SCHEMA_ID, SBE_SCHEMA_VERSION);
 
         let mut buf = Vec::new();
         buf.extend_from_slice(&header);
         buf.push((-2i8) as u8); // price_exponent
         buf.push((-4i8) as u8); // qty_exponent
-        buf.extend_from_slice(&create_group_header(KLINES_BLOCK_LENGTH, 1));
-        buf.extend_from_slice(&1_700_000_000_000_000i64.to_le_bytes()); // open_time (micros)
-        buf.extend_from_slice(&12_000i64.to_le_bytes()); // open_price
-        buf.extend_from_slice(&12_500i64.to_le_bytes()); // high_price
-        buf.extend_from_slice(&11_900i64.to_le_bytes()); // low_price
-        buf.extend_from_slice(&12_345i64.to_le_bytes()); // close_price
-        buf.extend_from_slice(&1_234_500i128.to_le_bytes()); // volume
-        buf.extend_from_slice(&1_700_000_059_999_000i64.to_le_bytes()); // close_time (micros)
-        buf.extend_from_slice(&2_345_600i128.to_le_bytes()); // quote_volume
-        buf.extend_from_slice(&100i64.to_le_bytes()); // num_trades
-        buf.extend_from_slice(&600_000i128.to_le_bytes()); // taker_buy_base_volume
-        buf.extend_from_slice(&1_200_000i128.to_le_bytes()); // taker_buy_quote_volume
+        buf.extend_from_slice(&create_group_header(block_length, 2));
+        for (open_time, close_price) in [
+            (1_700_000_000_000_000i64, 12_345i64),
+            (1_700_000_060_000_000, 12_400),
+        ] {
+            buf.extend_from_slice(&open_time.to_le_bytes()); // open_time (micros)
+            buf.extend_from_slice(&12_000i64.to_le_bytes()); // open_price
+            buf.extend_from_slice(&12_500i64.to_le_bytes()); // high_price
+            buf.extend_from_slice(&11_900i64.to_le_bytes()); // low_price
+            buf.extend_from_slice(&close_price.to_le_bytes()); // close_price
+            buf.extend_from_slice(&1_234_500i128.to_le_bytes()); // volume
+            buf.extend_from_slice(&(open_time + 59_999_000).to_le_bytes()); // close_time (micros)
+            buf.extend_from_slice(&2_345_600i128.to_le_bytes()); // quote_volume
+            buf.extend_from_slice(&100i64.to_le_bytes()); // num_trades
+            buf.extend_from_slice(&600_000i128.to_le_bytes()); // taker_buy_base_volume
+            buf.extend_from_slice(&1_200_000i128.to_le_bytes()); // taker_buy_quote_volume
+            buf.resize(
+                buf.len() + usize::from(block_length - KLINES_BLOCK_LENGTH),
+                0xFF,
+            );
+        }
 
         let klines = decode_klines(&buf).unwrap();
 
         assert_eq!(klines.price_exponent, -2);
         assert_eq!(klines.qty_exponent, -4);
-        assert_eq!(klines.klines.len(), 1);
+        assert_eq!(klines.klines.len(), 2);
         assert_eq!(klines.klines[0].open_time, 1_700_000_000_000_000);
         assert_eq!(klines.klines[0].close_price, 12_345);
         assert_eq!(i128::from_le_bytes(klines.klines[0].volume), 1_234_500);
         assert_eq!(klines.klines[0].num_trades, 100);
+        assert_eq!(klines.klines[1].open_time, 1_700_000_060_000_000);
+        assert_eq!(klines.klines[1].close_price, 12_400);
+        assert_eq!(klines.klines[1].num_trades, 100);
+    }
+
+    #[rstest]
+    fn test_decode_klines_rejects_short_block() {
+        let header = create_header(2, KLINES_TEMPLATE_ID, SBE_SCHEMA_ID, SBE_SCHEMA_VERSION);
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&header);
+        buf.push((-2i8) as u8); // price_exponent
+        buf.push((-4i8) as u8); // qty_exponent
+        buf.extend_from_slice(&create_group_header(KLINES_BLOCK_LENGTH - 1, 0));
+
+        assert!(matches!(
+            decode_klines(&buf),
+            Err(SbeDecodeError::InvalidBlockLength {
+                expected: KLINES_BLOCK_LENGTH,
+                actual: 119
+            })
+        ));
     }
 
     fn build_new_order_full_buffer(expiry_reason: ExpiryReason) -> Vec<u8> {
