@@ -451,6 +451,7 @@ impl HyperliquidExecutionClient {
             USER_STREAMS_ENDPOINT,
         ));
         ws_client.set_post_timeout(Duration::from_secs(config.ws_post_timeout_secs));
+        ws_client.set_skips_uncached_coins(config.instrument_ids.is_some());
 
         let clock = get_atomic_clock_realtime();
         let emitter = ExecutionEventEmitter::new(

@@ -149,6 +149,9 @@ pub struct HyperliquidWebSocketClient {
     client_id: u64,
     connection_permit: Arc<Mutex<Option<tokio::sync::OwnedSemaphorePermit>>>,
     post_timeout: Duration,
+    /// Set when the owner loads only some instruments, so a fill on an uncached
+    /// coin belongs to a market it does not trade rather than a missing one.
+    skips_uncached_coins: bool,
     task_handle: Arc<SharedTaskSlot<()>>,
     connect_lock: Arc<tokio::sync::Mutex<()>>,
     account_id: Option<AccountId>,
@@ -183,6 +186,7 @@ impl Clone for HyperliquidWebSocketClient {
             client_id: self.client_id,
             connection_permit: Arc::clone(&self.connection_permit),
             post_timeout: self.post_timeout,
+            skips_uncached_coins: self.skips_uncached_coins,
             task_handle: Arc::clone(&self.task_handle),
             connect_lock: Arc::clone(&self.connect_lock),
             account_id: self.account_id,
@@ -235,6 +239,7 @@ impl HyperliquidWebSocketClient {
             client_id: NEXT_WEBSOCKET_CLIENT_ID.fetch_add(1, Ordering::Relaxed),
             connection_permit: Arc::new(Mutex::new(None)),
             post_timeout: HTTP_TIMEOUT,
+            skips_uncached_coins: false,
             cmd_tx: {
                 // Placeholder channel until connect() creates the real handler and replays queued instruments
                 let (tx, _) = tokio::sync::mpsc::unbounded_channel();
@@ -409,6 +414,7 @@ impl HyperliquidWebSocketClient {
         let rate_limits = Arc::clone(&self.rate_limits);
         let client_id = self.client_id;
         let connection_permit = Arc::clone(&self.connection_permit);
+        let skips_uncached_coins = self.skips_uncached_coins;
 
         if let Err(e) = self.task_handle.spawn(async move {
             let mut handler = FeedHandler::new(
@@ -422,6 +428,7 @@ impl HyperliquidWebSocketClient {
                 post_router,
                 Arc::clone(&rate_limits),
                 client_id,
+                skips_uncached_coins,
             );
 
             let resubscribe_all = || {
@@ -523,6 +530,12 @@ impl HyperliquidWebSocketClient {
 
     pub fn set_post_timeout(&mut self, timeout: Duration) {
         self.post_timeout = timeout;
+    }
+
+    /// Logs fills on uncached coins at debug rather than warn level, for an owner
+    /// that loads only some instruments. Takes effect on the next connect.
+    pub fn set_skips_uncached_coins(&mut self, skips: bool) {
+        self.skips_uncached_coins = skips;
     }
 
     pub(crate) fn begin_shutdown(&self) {
@@ -2991,6 +3004,23 @@ mod tests {
 
         assert_eq!(client.post_timeout, timeout);
         assert_eq!(client.clone().post_timeout, timeout);
+    }
+
+    #[rstest]
+    fn set_skips_uncached_coins_updates_client_and_clone() {
+        let mut client = HyperliquidWebSocketClient::new(
+            None,
+            HyperliquidEnvironment::Testnet,
+            None,
+            TransportBackend::default(),
+            None,
+        );
+        assert!(!client.skips_uncached_coins);
+
+        client.set_skips_uncached_coins(true);
+
+        assert!(client.skips_uncached_coins);
+        assert!(client.clone().skips_uncached_coins);
     }
 
     #[rstest]

@@ -269,6 +269,7 @@ pub(super) struct FeedHandler {
     processed_trade_ids: FifoCache<u64, 10_000>,
     processed_public_trade_ids: FifoCache<(Ustr, u64), 10_000>,
     asset_context_caches: AssetContextCaches,
+    skips_uncached_coins: bool,
 }
 
 impl FeedHandler {
@@ -288,6 +289,7 @@ impl FeedHandler {
         post_router: Arc<PostRouter>,
         rate_limits: Arc<WebSocketRateLimits>,
         client_id: u64,
+        skips_uncached_coins: bool,
     ) -> Self {
         let heartbeat = tokio::time::interval_at(
             tokio::time::Instant::now() + HEARTBEAT_INTERVAL,
@@ -323,6 +325,7 @@ impl FeedHandler {
             processed_trade_ids: FifoCache::new(),
             processed_public_trade_ids: FifoCache::new(),
             asset_context_caches: AssetContextCaches::default(),
+            skips_uncached_coins,
         }
     }
 
@@ -610,6 +613,7 @@ impl FeedHandler {
                                         &mut self.bar_cache,
                                         &self.all_dex_asset_ctxs_instrument_ids,
                                         self.all_mids_data_types.as_slice(),
+                                        self.skips_uncached_coins,
                                     );
 
                                     if !nautilus_msgs.is_empty() {
@@ -777,6 +781,7 @@ impl FeedHandler {
         bar_cache: &mut AHashMap<String, CandleData>,
         all_dex_asset_ctxs_instrument_ids: &AHashMap<Ustr, Vec<Option<InstrumentId>>>,
         all_mids_data_types: &[DataType],
+        skips_uncached_coins: bool,
     ) -> Vec<NautilusWsMessage> {
         let mut result = Vec::new();
 
@@ -820,6 +825,7 @@ impl FeedHandler {
                                 account_id,
                                 ts_init,
                                 processed_trade_ids,
+                                skips_uncached_coins,
                             ) {
                                 log::debug!("Successfully created fill message");
                                 result.push(msg);
@@ -856,6 +862,7 @@ impl FeedHandler {
                         account_id,
                         ts_init,
                         processed_trade_ids,
+                        skips_uncached_coins,
                     )
                 {
                     result.push(msg);
@@ -1015,6 +1022,7 @@ impl FeedHandler {
         account_id: AccountId,
         ts_init: UnixNanos,
         processed_trade_ids: &mut FifoCache<u64, 10_000>,
+        skips_uncached_coins: bool,
     ) -> Option<NautilusWsMessage> {
         let mut exec_reports = Vec::new();
 
@@ -1055,6 +1063,11 @@ impl FeedHandler {
                         log::error!("Error parsing fill: {e}");
                     }
                 }
+            } else if skips_uncached_coins {
+                log::debug!(
+                    "Skipping fill outside the instrument filter: coin={}",
+                    fill.coin
+                );
             } else {
                 // Not marked as processed so fill is retried if instrument loads later
                 log::warn!("No instrument found for fill coin={}", fill.coin);
@@ -1980,6 +1993,7 @@ mod tests {
             Arc::clone(&post_router),
             Arc::new(WebSocketRateLimits::new()),
             1,
+            false,
         );
 
         let id = 99;
@@ -2039,6 +2053,7 @@ mod tests {
             PostRouter::new(),
             Arc::new(WebSocketRateLimits::new()),
             1,
+            false,
         );
 
         let subscription = || SubscriptionRequest::L2Book {
@@ -2291,6 +2306,7 @@ mod tests {
             post_router,
             Arc::new(WebSocketRateLimits::new()),
             1,
+            false,
         );
         let subscription = SubscriptionRequest::Notification {
             user: SECRET_MARKER.to_string(),
@@ -2401,6 +2417,7 @@ mod tests {
             PostRouter::new(),
             Arc::clone(&limits),
             1,
+            false,
         );
         raw_tx
             .send(Message::Text(
