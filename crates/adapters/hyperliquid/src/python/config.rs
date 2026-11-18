@@ -102,6 +102,7 @@ impl HyperliquidDataClientConfig {
             update_instruments_interval_mins: update_instruments_interval_mins
                 .unwrap_or(defaults.update_instruments_interval_mins),
             transport_backend: transport_backend.unwrap_or(defaults.transport_backend),
+            instrument_ids: defaults.instrument_ids,
         }
     }
 
@@ -187,6 +188,7 @@ impl HyperliquidExecutionClientConfig {
             outcome_settlement_poll_secs: defaults.outcome_settlement_poll_secs,
             order_expires_after_ms: defaults.order_expires_after_ms,
             modify_expires_after_ms: defaults.modify_expires_after_ms,
+            instrument_ids: defaults.instrument_ids,
         }
     }
 

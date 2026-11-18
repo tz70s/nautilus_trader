@@ -1325,6 +1325,31 @@ impl HyperliquidWebSocketClient {
         }
     }
 
+    /// Caches instruments with one swap of the instrument map, keeping cached
+    /// instruments that are not in the batch.
+    ///
+    /// Any existing instrument with the same raw_symbol will be replaced.
+    pub fn extend_instruments(&self, instruments: &[InstrumentAny]) {
+        self.instruments.rcu(|m| {
+            for instrument in instruments {
+                m.insert(instrument.raw_symbol().inner(), instrument.clone());
+            }
+        });
+
+        // Before connect() the handler isn't running; these sends fail and that's expected
+        // because connect() replays the instruments via InitializeInstruments
+        if let Ok(cmd_tx) = self.cmd_tx.try_read() {
+            for instrument in instruments {
+                if cmd_tx
+                    .send(HandlerCommand::UpdateInstrument(instrument.clone()))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        }
+    }
+
     /// Returns a shared reference to the instrument cache.
     #[must_use]
     pub fn instruments_cache(&self) -> Arc<AtomicMap<Ustr, InstrumentAny>> {
@@ -2724,7 +2749,10 @@ fn subscription_from_topic(topic: &str) -> anyhow::Result<SubscriptionRequest> {
 #[cfg(test)]
 mod tests {
     use nautilus_live::{SocketReconnectRegistry, SocketReconnectRequestOutcome};
-    use nautilus_model::{identifiers::ClientId, instruments::stubs::crypto_perpetual_ethusdt};
+    use nautilus_model::{
+        identifiers::ClientId,
+        instruments::stubs::{btcusd_bybit, crypto_perpetual_ethusdt, ethusd_bybit},
+    };
     use nautilus_network::mode::ReconnectRequestOutcome;
     use rstest::rstest;
     use ustr::Ustr;
@@ -3224,6 +3252,45 @@ mod tests {
 
         assert!(error.to_string().contains("at most 1000"));
         assert_eq!(cmd_rx.len(), HYPERLIQUID_WS_SUBSCRIPTIONS_MAX);
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_extend_instruments_keeps_cached_and_updates_handler() {
+        let client = HyperliquidWebSocketClient::new(
+            Some("wss://extend-instruments.test/ws".to_string()),
+            HyperliquidEnvironment::Testnet,
+            None,
+            TransportBackend::default(),
+            None,
+        );
+        let cached = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
+        client.cache_instrument(cached.clone());
+        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        *client.cmd_tx.write().await = cmd_tx;
+        let batch = [
+            InstrumentAny::CryptoPerpetual(btcusd_bybit()),
+            InstrumentAny::CryptoPerpetual(ethusd_bybit()),
+        ];
+
+        client.extend_instruments(&batch);
+
+        assert_eq!(client.instruments.len(), 3);
+        for instrument in batch.iter().chain([&cached]) {
+            assert!(
+                client
+                    .instruments
+                    .contains_key(&instrument.raw_symbol().inner())
+            );
+        }
+        let mut updated = Vec::new();
+        while let Ok(HandlerCommand::UpdateInstrument(instrument)) = cmd_rx.try_recv() {
+            updated.push(instrument.id());
+        }
+        assert_eq!(
+            updated,
+            batch.iter().map(Instrument::id).collect::<Vec<_>>()
+        );
     }
 
     #[rstest]

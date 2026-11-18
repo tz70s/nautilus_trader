@@ -27,7 +27,7 @@ use std::{
     time::Duration,
 };
 
-use ahash::AHashMap;
+use ahash::{AHashMap, AHashSet};
 use anyhow::Context;
 use nautilus_common::cache::InstrumentLookupError;
 use nautilus_core::{
@@ -985,6 +985,8 @@ pub struct HyperliquidHttpClient {
     asset_indices: Arc<AtomicMap<Ustr, u32>>,
     /// Mapping from spot fill coin (`@{pair_index}`) to instrument symbol.
     spot_fill_coins: Arc<AtomicMap<Ustr, Ustr>>,
+    /// Symbols of the only instruments to load, when set.
+    instrument_filter: Option<Arc<AHashSet<Ustr>>>,
     client_order_id_cloids: Arc<Mutex<AHashMap<ClientOrderId, Cloid>>>,
     account_id: Option<AccountId>,
     /// Optional override address for queries (agent wallet / API sub-key support).
@@ -1041,6 +1043,7 @@ impl HyperliquidHttpClient {
             instruments_by_coin: Arc::new(AtomicMap::new()),
             asset_indices: Arc::new(AtomicMap::new()),
             spot_fill_coins: Arc::new(AtomicMap::new()),
+            instrument_filter: None,
             client_order_id_cloids: Arc::new(Mutex::new(AHashMap::new())),
             account_id: None,
             account_address: None,
@@ -1093,6 +1096,23 @@ impl HyperliquidHttpClient {
         (mapping_count == 1).then_some(cloid)
     }
 
+    /// Restricts the instruments this client loads to `instrument_ids`, or loads
+    /// every market when `None`.
+    ///
+    /// Activity on a market outside the filter is skipped in reports rather than
+    /// treated as unresolved, and reconciliation covers only the filtered dexes.
+    pub fn set_instrument_filter(&mut self, instrument_ids: Option<&[InstrumentId]>) {
+        self.instrument_filter =
+            instrument_ids.map(|ids| Arc::new(ids.iter().map(|id| id.symbol.inner()).collect()));
+    }
+
+    /// Returns `true` when a report row whose coin has no cached instrument may be
+    /// skipped without leaving the report incomplete: with an instrument filter
+    /// set, such a row belongs to a market this client does not trade.
+    fn skips_uncached_coins(&self) -> bool {
+        self.instrument_filter.is_some()
+    }
+
     /// Removes the cached CLOID for a client order ID.
     pub fn remove_client_order_id_cloid(&self, client_order_id: &ClientOrderId) -> Option<Cloid> {
         self.client_order_id_cloids.lock().remove(client_order_id)
@@ -1134,6 +1154,7 @@ impl HyperliquidHttpClient {
             instruments_by_coin: Arc::new(AtomicMap::new()),
             asset_indices: Arc::new(AtomicMap::new()),
             spot_fill_coins: Arc::new(AtomicMap::new()),
+            instrument_filter: None,
             client_order_id_cloids: Arc::new(Mutex::new(AHashMap::new())),
             account_id: None,
             account_address: None,
@@ -1212,6 +1233,7 @@ impl HyperliquidHttpClient {
                     instruments_by_coin: Arc::new(AtomicMap::new()),
                     asset_indices: Arc::new(AtomicMap::new()),
                     spot_fill_coins: Arc::new(AtomicMap::new()),
+                    instrument_filter: None,
                     client_order_id_cloids: Arc::new(Mutex::new(AHashMap::new())),
                     account_id: None,
                     account_address,
@@ -1256,6 +1278,7 @@ impl HyperliquidHttpClient {
             instruments_by_coin: Arc::new(AtomicMap::new()),
             asset_indices: Arc::new(AtomicMap::new()),
             spot_fill_coins: Arc::new(AtomicMap::new()),
+            instrument_filter: None,
             client_order_id_cloids: Arc::new(Mutex::new(AHashMap::new())),
             account_id: None,
             account_address: None,
@@ -1356,6 +1379,13 @@ impl HyperliquidHttpClient {
 
     /// Caches a single instrument.
     ///
+    /// See [`Self::cache_instruments`].
+    pub fn cache_instrument(&self, instrument: &InstrumentAny) {
+        self.cache_instruments(std::slice::from_ref(instrument));
+    }
+
+    /// Caches instruments, swapping each cache map once for the whole batch.
+    ///
     /// This is required for parsing orders, fills, and positions into reports.
     /// Any existing instrument with the same symbol will be replaced.
     ///
@@ -1364,43 +1394,62 @@ impl HyperliquidHttpClient {
     /// refetching venue metadata. An instrument without the key keeps its
     /// existing asset index, if any, because guessing one would route orders to
     /// the wrong asset.
-    pub fn cache_instrument(&self, instrument: &InstrumentAny) {
-        let full_symbol = instrument.symbol().inner();
-        let coin = instrument.raw_symbol().inner();
+    pub fn cache_instruments(&self, instruments: &[InstrumentAny]) {
+        let mut asset_indices = Vec::with_capacity(instruments.len());
+        let mut by_coin = Vec::with_capacity(instruments.len());
 
-        match instrument
-            .info()
-            .and_then(|info| info.get_u64(ASSET_INDEX_INFO_KEY))
-            .and_then(|value| u32::try_from(value).ok())
-        {
-            Some(asset_index) => self.asset_indices.rcu(|m| {
-                m.insert(full_symbol, asset_index);
-            }),
-            // vault tokens are synthesized locally to value balances and are never
-            // submitted, so the venue assigns them no asset index to carry
-            None if coin.starts_with(VAULT_TOKEN_PREFIX) => {}
-            // without an index we cannot address the asset on the wire, so a market we
-            // have never indexed is untradable rather than merely stale
-            None if self.asset_indices.get_cloned(&full_symbol).is_none() => log::warn!(
-                "Instrument '{full_symbol}' carries no '{ASSET_INDEX_INFO_KEY}' info value \
-                 and has no cached asset index; orders for it will be rejected"
-            ),
-            None => log::warn!(
-                "Instrument '{full_symbol}' carries no '{ASSET_INDEX_INFO_KEY}' info value; \
-                 leaving the cached asset index unchanged"
-            ),
+        for instrument in instruments {
+            let full_symbol = instrument.symbol().inner();
+            let coin = instrument.raw_symbol().inner();
+
+            match instrument
+                .info()
+                .and_then(|info| info.get_u64(ASSET_INDEX_INFO_KEY))
+                .and_then(|value| u32::try_from(value).ok())
+            {
+                Some(asset_index) => asset_indices.push((full_symbol, asset_index)),
+                // vault tokens are synthesized locally to value balances and are never
+                // submitted, so the venue assigns them no asset index to carry
+                None if coin.starts_with(VAULT_TOKEN_PREFIX) => {}
+                // without an index we cannot address the asset on the wire, so a market we
+                // have never indexed is untradable rather than merely stale
+                None if self.asset_indices.get_cloned(&full_symbol).is_none() => log::warn!(
+                    "Instrument '{full_symbol}' carries no '{ASSET_INDEX_INFO_KEY}' info value \
+                     and has no cached asset index; orders for it will be rejected"
+                ),
+                None => log::warn!(
+                    "Instrument '{full_symbol}' carries no '{ASSET_INDEX_INFO_KEY}' info value; \
+                     leaving the cached asset index unchanged"
+                ),
+            }
+
+            // Composite key allows disambiguating same coin across PERP and SPOT
+            match HyperliquidProductType::from_symbol(full_symbol.as_str()) {
+                Ok(product_type) => {
+                    let alias = cache_alias_for_symbol(full_symbol.as_str())
+                        .map(|alias| Ustr::from(alias.as_str()));
+                    by_coin.push((coin, product_type, alias, instrument));
+                }
+                Err(_) => log::warn!("Unable to determine product type for symbol: {full_symbol}"),
+            }
+        }
+
+        if !asset_indices.is_empty() {
+            self.asset_indices
+                .rcu(|m| m.extend(asset_indices.iter().copied()));
         }
 
         self.instruments.rcu(|m| {
-            m.insert(full_symbol, instrument.clone());
-            // HTTP responses only include coins, external code may lookup by coin
-            m.insert(coin, instrument.clone());
+            for instrument in instruments {
+                m.insert(instrument.symbol().inner(), instrument.clone());
+                // HTTP responses only include coins, external code may lookup by coin
+                m.insert(instrument.raw_symbol().inner(), instrument.clone());
+            }
         });
 
-        // Composite key allows disambiguating same coin across PERP and SPOT
-        if let Ok(product_type) = HyperliquidProductType::from_symbol(full_symbol.as_str()) {
-            self.instruments_by_coin.rcu(|m| {
-                m.insert((coin, product_type), instrument.clone());
+        self.instruments_by_coin.rcu(|m| {
+            for (coin, product_type, alias, instrument) in &by_coin {
+                m.insert((*coin, *product_type), (*instrument).clone());
 
                 // Secondary alias key for two distinct callers:
                 //
@@ -1426,18 +1475,14 @@ impl HyperliquidHttpClient {
                 // spot loader sorts canonical pairs first so the alias resolves
                 // to the canonical one. For standard perps `base == coin`, so
                 // the alias is a no-op.
-                if let Some(alias_ustr) = cache_alias_for_symbol(full_symbol.as_str())
-                    .map(|alias| Ustr::from(alias.as_str()))
-                {
-                    let key = (alias_ustr, product_type);
-                    if alias_ustr != coin && !m.contains_key(&key) {
-                        m.insert(key, instrument.clone());
+                if let Some(alias) = *alias {
+                    let key = (alias, *product_type);
+                    if alias != *coin && !m.contains_key(&key) {
+                        m.insert(key, (*instrument).clone());
                     }
                 }
-            });
-        } else {
-            log::warn!("Unable to determine product type for symbol: {full_symbol}");
-        }
+            }
+        });
     }
 
     fn get_or_create_instrument(
@@ -1543,8 +1588,10 @@ impl HyperliquidHttpClient {
             self.cache_instrument(&instrument);
 
             Some(instrument)
+        } else if self.skips_uncached_coins() {
+            log::debug!("Skipping coin outside the instrument filter: {coin}");
+            None
         } else {
-            // For non-vault tokens, log warning and return None
             log::warn!("Instrument not found in cache: {coin}");
             None
         }
@@ -1684,7 +1731,10 @@ impl HyperliquidHttpClient {
                 );
             }
         }
-        let defs = deduped;
+        let defs = match &self.instrument_filter {
+            Some(filter) => filter_instrument_defs(deduped, filter),
+            None => deduped,
+        };
 
         // Populate asset indices for all instruments (including filtered HIP-3)
         self.asset_indices.rcu(|m| {
@@ -1753,6 +1803,8 @@ impl HyperliquidHttpClient {
             for asset in &meta.universe {
                 if let Some(instrument_id) = raw_symbol_to_id.get(&asset.name) {
                     instrument_ids.push(Some(*instrument_id));
+                } else if self.skips_uncached_coins() {
+                    instrument_ids.push(None);
                 } else {
                     log::warn!(
                         "Missing cached Hyperliquid instrument for dex='{}' raw_symbol='{}'",
@@ -2439,7 +2491,7 @@ impl HyperliquidHttpClient {
                     Some(instrument) => instrument,
                     // get_or_create_instrument warns with the coin
                     None => {
-                        complete = false;
+                        complete &= self.skips_uncached_coins();
                         continue;
                     }
                 };
@@ -2512,7 +2564,7 @@ impl HyperliquidHttpClient {
                 // get_or_create_instrument warns with the coin
                 Some(instrument) => instrument,
                 None => {
-                    complete = false;
+                    complete &= self.skips_uncached_coins();
                     continue;
                 }
             };
@@ -2835,7 +2887,7 @@ impl HyperliquidHttpClient {
                 Some(inst) => inst,
                 // get_or_create_instrument warns with the coin
                 None => {
-                    complete = false;
+                    complete &= self.skips_uncached_coins();
                     continue;
                 }
             };
@@ -2954,7 +3006,7 @@ impl HyperliquidHttpClient {
                     Some(instrument) => instrument,
                     // get_or_create_instrument warns with the coin
                     None => {
-                        complete = false;
+                        complete &= self.skips_uncached_coins();
                         continue;
                     }
                 };
@@ -3155,7 +3207,7 @@ impl HyperliquidHttpClient {
                 Some(inst) => inst,
                 // get_or_create_instrument warns with the coin
                 None => {
-                    complete = false;
+                    complete &= self.skips_uncached_coins();
                     continue;
                 }
             };
@@ -3908,6 +3960,10 @@ impl HyperliquidHttpClient {
         historical_orders: &[HyperliquidOrderStatusEntry],
         fills: &HyperliquidFills,
     ) -> Result<Vec<Option<Ustr>>> {
+        if self.instrument_filter.is_some() {
+            return Ok(self.reconciliation_dexes(None));
+        }
+
         if historical_orders.len() >= HYPERLIQUID_RECENT_HISTORY_LIMIT
             || fills.len() >= HYPERLIQUID_RECENT_HISTORY_LIMIT
         {
@@ -3941,6 +3997,31 @@ impl HyperliquidHttpClient {
 pub(crate) struct ReportSweep<T> {
     pub reports: Vec<T>,
     pub complete: bool,
+}
+
+// Asset indices are positional in the full venue metadata, so the filter applies
+// only after every def has its index.
+fn filter_instrument_defs(
+    defs: Vec<HyperliquidInstrumentDef>,
+    filter: &AHashSet<Ustr>,
+) -> Vec<HyperliquidInstrumentDef> {
+    let defs: Vec<_> = defs
+        .into_iter()
+        .filter(|def| filter.contains(&def.symbol))
+        .collect();
+
+    if defs.len() < filter.len() {
+        let found: AHashSet<Ustr> = defs.iter().map(|def| def.symbol).collect();
+        let mut missing: Vec<&str> = filter
+            .iter()
+            .filter(|symbol| !found.contains(*symbol))
+            .map(Ustr::as_str)
+            .collect();
+        missing.sort_unstable();
+        log::warn!("Hyperliquid instrument filter matched no venue market for: {missing:?}");
+    }
+
+    defs
 }
 
 fn reconciliation_dexes_from_builders(
@@ -4075,12 +4156,13 @@ mod tests {
             consts::{ASSET_INDEX_INFO_KEY, HYPERLIQUID_VENUE, NAUTILUS_BUILDER_ADDRESS},
             credential::EvmPrivateKey,
             enums::{HyperliquidEnvironment, HyperliquidProductType},
+            testing::load_test_data,
         },
         http::{
             models::{
                 Cloid, HyperliquidExchangeAction, HyperliquidExchangeCancelOrderRequest,
-                HyperliquidExchangeResponse, HyperliquidOrderStatusEntry, PerpAsset, PerpDex,
-                PerpMeta,
+                HyperliquidExchangeResponse, HyperliquidFills, HyperliquidOrderStatusEntry,
+                PerpAsset, PerpDex, PerpMeta,
             },
             query::InfoRequest,
         },
@@ -4374,6 +4456,184 @@ mod tests {
         });
 
         addr
+    }
+
+    async fn handle_multi_dex_info(body: axum::body::Bytes) -> Response {
+        let request_body: Value = serde_json::from_slice(&body).unwrap();
+
+        match request_body.get("type").and_then(|value| value.as_str()) {
+            Some("spotMeta") => Json(json!({
+                "tokens": [
+                    {"index": 0, "isCanonical": true, "name": "USDC", "szDecimals": 8,
+                     "tokenId": "0x1", "weiDecimals": 8},
+                    {"index": 150, "isCanonical": true, "name": "HYPE", "szDecimals": 2,
+                     "tokenId": "0x96", "weiDecimals": 8},
+                    {"index": 360, "isCanonical": true, "name": "USDH", "szDecimals": 2,
+                     "tokenId": "0x168", "weiDecimals": 8},
+                    {"index": 235, "isCanonical": true, "name": "USDE", "szDecimals": 2,
+                     "tokenId": "0xeb", "weiDecimals": 8}
+                ],
+                "universe": [
+                    {"name": "@107", "tokens": [150, 0], "index": 107, "isCanonical": true}
+                ]
+            }))
+            .into_response(),
+            Some("allPerpMetas") => Json(json!([
+                {"collateralToken": 0, "marginTables": [], "universe": [
+                    {"maxLeverage": 40, "name": "BTC", "szDecimals": 5},
+                    {"maxLeverage": 25, "name": "ETH", "szDecimals": 4}
+                ]},
+                {"collateralToken": 360, "marginTables": [], "universe": [
+                    {"maxLeverage": 20, "name": "km:US500", "szDecimals": 3},
+                    {"maxLeverage": 20, "name": "km:GOLD", "szDecimals": 3}
+                ]},
+                {"collateralToken": 235, "marginTables": [], "universe": [
+                    {"maxLeverage": 20, "name": "hyna:BTC", "szDecimals": 5}
+                ]}
+            ]))
+            .into_response(),
+            Some("perpDexs") => {
+                Json(json!([null, {"name": "km"}, {"name": "hyna"}])).into_response()
+            }
+            _ => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "unavailable"})),
+            )
+                .into_response(),
+        }
+    }
+
+    async fn multi_dex_client(instrument_ids: Option<&[InstrumentId]>) -> HyperliquidHttpClient {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let router = Router::new().route("/info", post(handle_multi_dex_info));
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        let mut client =
+            HyperliquidHttpClient::new(HyperliquidEnvironment::Mainnet, 60, None).unwrap();
+        client.set_base_info_url(format!("http://{addr}/info"));
+        client.set_account_id(AccountId::from("HYPERLIQUID-001"));
+        client.set_instrument_filter(instrument_ids);
+        client
+    }
+
+    fn asset_indices(client: &HyperliquidHttpClient) -> Vec<(String, u32)> {
+        let mut indices: Vec<_> = client
+            .asset_indices
+            .load()
+            .iter()
+            .map(|(symbol, index)| (symbol.to_string(), *index))
+            .collect();
+        indices.sort();
+        indices
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_instrument_filter_loads_only_wanted_instruments_with_unchanged_asset_indices() {
+        let unfiltered = multi_dex_client(None).await;
+        let all = unfiltered.request_instruments().await.unwrap();
+        unfiltered.cache_instruments(&all);
+        let wanted = [
+            InstrumentId::from("km:GOLD-USD-PERP.HYPERLIQUID"),
+            InstrumentId::from("ETH-USD-PERP.HYPERLIQUID"),
+            InstrumentId::from("HYPE-USDC-SPOT.HYPERLIQUID"),
+        ];
+        let filtered = multi_dex_client(Some(&wanted)).await;
+
+        let instruments = filtered.request_instruments().await.unwrap();
+        filtered.cache_instruments(&instruments);
+
+        assert_eq!(all.len(), 6);
+        let mut ids: Vec<_> = instruments.iter().map(Instrument::id).collect();
+        ids.sort();
+        let mut expected = wanted.to_vec();
+        expected.sort();
+        assert_eq!(ids, expected);
+        let expected_indices: Vec<_> = asset_indices(&unfiltered)
+            .into_iter()
+            .filter(|(symbol, _)| wanted.iter().any(|id| id.symbol.as_str() == symbol))
+            .collect();
+        assert_eq!(asset_indices(&filtered), expected_indices);
+        assert_eq!(filtered.get_asset_index("ETH-USD-PERP"), Some(1));
+        assert_eq!(filtered.get_asset_index("km:GOLD-USD-PERP"), Some(110_001));
+        assert_eq!(filtered.get_asset_index("HYPE-USDC-SPOT"), Some(10_107));
+        assert_eq!(filtered.get_asset_index("BTC-USD-PERP"), None);
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_instrument_filter_limits_reconciliation_dexes() {
+        let unfiltered = multi_dex_client(None).await;
+        unfiltered.cache_instruments(&unfiltered.request_instruments().await.unwrap());
+        let filtered =
+            multi_dex_client(Some(&[InstrumentId::from("km:GOLD-USD-PERP.HYPERLIQUID")])).await;
+        filtered.cache_instruments(&filtered.request_instruments().await.unwrap());
+        let activity: HyperliquidFills = serde_json::from_value(json!([{
+            "coin": "hyna:BTC", "px": "90000", "sz": "0.001", "side": "B",
+            "time": 1700000001000_u64, "startPosition": "0", "dir": "Open Long",
+            "closedPnl": "0", "hash": "0xa", "oid": 1, "crossed": true,
+            "fee": "0.01", "feeToken": "USDE", "tid": 1
+        }]))
+        .unwrap();
+
+        assert_eq!(
+            unfiltered.reconciliation_dexes(None),
+            vec![None, Some(Ustr::from("hyna")), Some(Ustr::from("km"))],
+        );
+        assert_eq!(
+            filtered.reconciliation_dexes(None),
+            vec![None, Some(Ustr::from("km"))],
+        );
+        assert_eq!(
+            filtered
+                .reconciliation_dexes_from_activity(&[], &activity)
+                .await
+                .unwrap(),
+            vec![None, Some(Ustr::from("km"))],
+        );
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_instrument_filter_skips_fills_outside_filter_as_complete() {
+        let fills: HyperliquidFills = load_test_data("http_query_order_fills.json");
+        let unfiltered = multi_dex_client(None).await;
+        let filtered =
+            multi_dex_client(Some(&[InstrumentId::from("ETH-USD-PERP.HYPERLIQUID")])).await;
+
+        let unfiltered_sweep = unfiltered
+            .fill_reports_from_response(fills.clone(), None)
+            .unwrap();
+        let filtered_sweep = filtered.fill_reports_from_response(fills, None).unwrap();
+
+        assert!(!unfiltered_sweep.complete);
+        assert!(filtered_sweep.complete);
+        assert!(filtered_sweep.reports.is_empty());
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_cache_instruments_matches_one_at_a_time() {
+        let source = multi_dex_client(None).await;
+        let instruments = source.request_instruments().await.unwrap();
+        let bulk = HyperliquidHttpClient::new(HyperliquidEnvironment::Mainnet, 60, None).unwrap();
+        let single = HyperliquidHttpClient::new(HyperliquidEnvironment::Mainnet, 60, None).unwrap();
+
+        bulk.cache_instruments(&instruments);
+        for instrument in &instruments {
+            single.cache_instrument(instrument);
+        }
+
+        assert_eq!(asset_indices(&bulk), asset_indices(&single));
+        assert_eq!(*bulk.instruments.load(), *single.instruments.load());
+        assert_eq!(
+            *bulk.instruments_by_coin.load(),
+            *single.instruments_by_coin.load(),
+        );
+        assert_eq!(bulk.asset_indices.len(), instruments.len());
     }
 
     #[rstest]

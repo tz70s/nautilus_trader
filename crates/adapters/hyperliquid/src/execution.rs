@@ -427,6 +427,7 @@ impl HyperliquidExecutionClient {
         http_client.set_normalize_prices(config.normalize_prices);
         http_client.set_market_order_slippage_bps(config.market_order_slippage_bps);
         http_client.set_include_builder_attribution(config.include_builder_attribution);
+        http_client.set_instrument_filter(config.instrument_ids.as_deref());
 
         if let Some(url) = &config.base_url_http {
             http_client.set_base_info_url(url.clone());
@@ -496,10 +497,7 @@ impl HyperliquidExecutionClient {
             );
         } else {
             log::debug!("Initialized {} instruments", instruments.len());
-
-            for instrument in &instruments {
-                self.http_client.cache_instrument(instrument);
-            }
+            self.http_client.cache_instruments(&instruments);
         }
 
         self.core.set_instruments_initialized();
@@ -2630,10 +2628,7 @@ impl HyperliquidExecutionClient {
             .request_instruments()
             .await
             .unwrap_or_default();
-
-        for instrument in instruments {
-            ws_client.cache_instrument(instrument);
-        }
+        ws_client.extend_instruments(&instruments);
 
         ws_client.connect().await?;
         if let Err(e) = ws_client

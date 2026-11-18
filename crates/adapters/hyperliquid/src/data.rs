@@ -151,6 +151,7 @@ impl HyperliquidDataClient {
         if let Some(url) = &config.base_url_http {
             http_client.set_base_info_url(url.clone());
         }
+        http_client.set_instrument_filter(config.instrument_ids.as_deref());
 
         let ws_url = config.base_url_ws.clone();
         let ws_client = HyperliquidWebSocketClient::new(
@@ -1668,10 +1669,8 @@ fn cache_instruments(
         }
     });
 
-    for instrument in instruments {
-        http_client.cache_instrument(instrument);
-        ws_client.cache_instrument(instrument.clone());
-    }
+    http_client.cache_instruments(instruments);
+    ws_client.extend_instruments(instruments);
 }
 
 /// Rebuilds the `allDexsAssetCtxs` mapping from the HTTP client's cached instruments.

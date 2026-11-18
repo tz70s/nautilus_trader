@@ -19,7 +19,7 @@
 use nautilus_core::string::secret::REDACTED;
 use nautilus_core::string::secret::SecretString;
 use nautilus_live::book::DEFAULT_BOOK_SNAPSHOT_TIMEOUT_SECS;
-use nautilus_model::identifiers::AccountId;
+use nautilus_model::identifiers::{AccountId, InstrumentId};
 use nautilus_network::websocket::TransportBackend;
 use serde::{Deserialize, Serialize};
 
@@ -105,6 +105,11 @@ pub struct HyperliquidDataClientConfig {
     /// the `transport-sockudo` feature is disabled).
     #[builder(default)]
     pub transport_backend: TransportBackend,
+    /// Instruments to load. `None` loads every market of every dex.
+    ///
+    /// When set, the client bootstraps, caches, publishes and refreshes only these
+    /// instruments. Asset indices are still derived from the full venue metadata.
+    pub instrument_ids: Option<Vec<InstrumentId>>,
 }
 
 #[cfg(feature = "python")]
@@ -253,6 +258,12 @@ pub struct HyperliquidExecutionClientConfig {
     /// As `order_expires_after_ms`, for modify actions. An expired modify leaves
     /// the order resting at its previous price.
     pub modify_expires_after_ms: Option<u64>,
+    /// Instruments to load. `None` loads every market of every dex.
+    ///
+    /// When set, the client caches only these instruments, reconciles only their
+    /// dexes, and skips venue activity on any other market rather than treating
+    /// it as an unresolved report.
+    pub instrument_ids: Option<Vec<InstrumentId>>,
 }
 
 #[cfg(feature = "python")]
@@ -412,6 +423,27 @@ book_snapshot_timeout_secs = 4
 
         assert_eq!(config.order_expires_after_ms, Some(350));
         assert_eq!(config.modify_expires_after_ms, Some(500));
+    }
+
+    #[rstest]
+    fn test_configs_toml_instrument_ids() {
+        let toml =
+            r#"instrument_ids = ["BTC-USD-PERP.HYPERLIQUID", "xyz:SKHY-USD-PERP.HYPERLIQUID"]"#;
+        let expected = Some(vec![
+            InstrumentId::from("BTC-USD-PERP.HYPERLIQUID"),
+            InstrumentId::from("xyz:SKHY-USD-PERP.HYPERLIQUID"),
+        ]);
+
+        let data: HyperliquidDataClientConfig = toml::from_str(toml).unwrap();
+        let exec: HyperliquidExecutionClientConfig = toml::from_str(toml).unwrap();
+
+        assert_eq!(data.instrument_ids, expected);
+        assert_eq!(exec.instrument_ids, expected);
+        assert_eq!(HyperliquidDataClientConfig::default().instrument_ids, None);
+        assert_eq!(
+            HyperliquidExecutionClientConfig::default().instrument_ids,
+            None
+        );
     }
 
     #[rstest]
