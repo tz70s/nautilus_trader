@@ -427,7 +427,9 @@ impl HyperliquidExecutionClient {
         http_client.set_normalize_prices(config.normalize_prices);
         http_client.set_market_order_slippage_bps(config.market_order_slippage_bps);
         http_client.set_include_builder_attribution(config.include_builder_attribution);
-        http_client.set_instrument_filter(config.instrument_ids.as_deref());
+        http_client
+            .set_instrument_filter(config.instrument_ids.as_deref())
+            .context("invalid Hyperliquid instrument filter")?;
 
         if let Some(url) = &config.base_url_http {
             http_client.set_base_info_url(url.clone());
