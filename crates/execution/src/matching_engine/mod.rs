@@ -1194,6 +1194,17 @@ impl OrderMatchingEngine {
         }
     }
 
+    /// The queue priority an order rests with: none for a reduce-only one,
+    /// which Hyperliquid refuses with a priority ("Priority ALO orders cannot
+    /// be reduce only"), so it is sent without one.
+    fn queue_priority_ms(&self, order: &OrderAny) -> Option<u64> {
+        if order.is_reduce_only() {
+            None
+        } else {
+            self.config.queue_priority_ms
+        }
+    }
+
     fn advance_l3_queue_on_delete(&mut self, book_order_id: OrderId) {
         for (client_order_id, orders_ahead) in &mut self.queue_ahead_orders {
             let Some(size_raw) = orders_ahead.shift_remove(&book_order_id) else {
@@ -4102,7 +4113,7 @@ impl OrderMatchingEngine {
             self.cancel_order(order, None);
         } else {
             if let Some(price) = order.price() {
-                self.snapshot_queue_position(order, price, self.config.queue_priority_ms);
+                self.snapshot_queue_position(order, price, self.queue_priority_ms(order));
             }
 
             // `order` is the caller's copy, so record Maker on the cached order
@@ -12848,6 +12859,33 @@ mod tests {
         Add(1, "100.00", "10.000", 0),
         Add(2, "100.00", "7.000", 1_800),
     ];
+
+    #[rstest]
+    fn test_a_reduce_only_order_rests_without_queue_priority() {
+        let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
+        let (engine, _cache) = get_queue_engine_clock(
+            instrument.clone(),
+            BookType::L3_MBO,
+            OrderMatchingEngineConfig {
+                queue_position: true,
+                queue_priority_ms: Some(400),
+                ..Default::default()
+            },
+            clock,
+        );
+        let order = |reduce_only| {
+            OrderTestBuilder::new(OrderType::Limit)
+                .instrument_id(instrument.id())
+                .side(OrderSide::Sell)
+                .price(Price::from("100.00"))
+                .quantity(Quantity::from("1.000"))
+                .reduce_only(reduce_only)
+                .build()
+        };
+        assert_eq!(engine.queue_priority_ms(&order(false)), Some(400));
+        assert_eq!(engine.queue_priority_ms(&order(true)), None);
+    }
 
     #[rstest]
     // Ours at 2 s against order 2 (7 at 1.8 s), young: by its rate.
