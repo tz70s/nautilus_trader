@@ -666,6 +666,9 @@ pub enum HyperliquidOrderStatus {
     /// Order rejected due to bad ALO price.
     #[serde(rename = "badAloPxRejected")]
     BadAloPxRejected,
+    /// Order rejected because a priority ALO order can't be reduce only.
+    #[serde(rename = "priorityAloReduceOnlyRejected")]
+    PriorityAloReduceOnlyRejected,
     /// IOC order canceled and rejected.
     #[serde(rename = "iocCancelRejected")]
     IocCancelRejected,
@@ -724,6 +727,7 @@ impl From<HyperliquidOrderStatus> for OrderStatus {
             | HyperliquidOrderStatus::PerpMarginRejected
             | HyperliquidOrderStatus::ReduceOnlyRejected
             | HyperliquidOrderStatus::BadAloPxRejected
+            | HyperliquidOrderStatus::PriorityAloReduceOnlyRejected
             | HyperliquidOrderStatus::IocCancelRejected
             | HyperliquidOrderStatus::BadTriggerPxRejected
             | HyperliquidOrderStatus::MarketOrderNoLiquidityRejected
@@ -1482,6 +1486,17 @@ mod tests {
         let tick_rejected: HyperliquidOrderStatus =
             serde_json::from_str(r#""tickRejected""#).unwrap();
         assert_eq!(tick_rejected, HyperliquidOrderStatus::TickRejected);
+
+        let priority_alo_reduce_only_rejected: HyperliquidOrderStatus =
+            serde_json::from_str(r#""priorityAloReduceOnlyRejected""#).unwrap();
+        assert_eq!(
+            priority_alo_reduce_only_rejected,
+            HyperliquidOrderStatus::PriorityAloReduceOnlyRejected
+        );
+        assert_eq!(
+            OrderStatus::from(priority_alo_reduce_only_rejected),
+            OrderStatus::Rejected
+        );
     }
 
     #[rstest]
